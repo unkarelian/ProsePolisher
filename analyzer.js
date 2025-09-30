@@ -156,24 +156,108 @@ export class Analyzer {
         console.log(`${LOG_PREFIX} User whitelist updated. Size: ${userWhitelist.size}`);
     }
 
-    isPhraseLowQuality(phrase) {
-        const words = phrase.toLowerCase().split(' '); // ensure lowercasing for whitelist check
+    getWordStats(phrase, userWhitelistSet = null) {
+        if (!phrase || typeof phrase !== 'string') {
+            return { total: 0, meaningfulCount: 0, commonCount: 0, hasWhitelistedWord: false };
+        }
+
+        const words = phrase.split(' ').filter(Boolean);
+        if (words.length === 0) {
+            return { total: 0, meaningfulCount: 0, commonCount: 0, hasWhitelistedWord: false };
+        }
+
+        const whitelist = userWhitelistSet || new Set((this.settings.whitelist || []).map(w => w.toLowerCase()));
+
+        let meaningfulCount = 0;
+        let commonCount = 0;
+        let hasWhitelistedWord = false;
+
+        for (const word of words) {
+            const lowerWord = word.toLowerCase();
+            if (whitelist.has(lowerWord) || defaultNames.has(lowerWord)) {
+                hasWhitelistedWord = true;
+            }
+
+            if (commonWords.has(lowerWord)) {
+                commonCount++;
+            } else {
+                meaningfulCount++;
+            }
+        }
+
+        return {
+            words,
+            total: words.length,
+            meaningfulCount,
+            commonCount,
+            hasWhitelistedWord,
+            allCommon: meaningfulCount === 0,
+        };
+    }
+
+    isPhraseLowQuality(wordStats) {
+        if (!wordStats || typeof wordStats !== 'object') return true;
 
         // Filter 1: Must be at least NGRAM_MIN words long.
-        if (words.length < NGRAM_MIN) return true;
+        if (wordStats.total < NGRAM_MIN) return true;
 
         // Filter 2: Check if phrase contains any user-whitelisted words or character names
         // These should cause phrases to be ignored entirely
-        const userWhitelist = new Set((this.settings.whitelist || []).map(w => w.toLowerCase()));
-        const hasWhitelistedWord = words.some(word => userWhitelist.has(word) || defaultNames.has(word));
-        if (hasWhitelistedWord) return true;
+        if (wordStats.hasWhitelistedWord) return true;
 
         // Filter 3: Must contain at least one non-common word to be interesting
-        // If all words in the phrase are common words, it's considered low quality
-        const allCommonWords = words.every(word => commonWords.has(word));
-        if (allCommonWords) return true;
+        if (wordStats.allCommon) return true;
+
+        // Filter 4: Require at least two meaningful (non-common) words to avoid stopword-heavy phrases
+        if (wordStats.meaningfulCount < 2) return true;
 
         return false;
+    }
+
+    calculateEntryScore(entry, wordStats, chunkType) {
+        if (!entry || !wordStats) {
+            return 0;
+        }
+
+        const distinctMessages = entry.messageCount || (entry.messageIds ? entry.messageIds.size : 0) || 0;
+        if (distinctMessages <= 0) {
+            return 0;
+        }
+
+        const totalOccurrences = entry.count || 0;
+        const averageOccurrences = distinctMessages > 0 ? totalOccurrences / distinctMessages : 0;
+
+        const totalWords = wordStats.total || entry.ngramLength || NGRAM_MIN;
+        const meaningfulRatio = totalWords > 0 ? (wordStats.meaningfulCount || 0) / totalWords : 0;
+        let wordQualityMultiplier = 0.7 + (meaningfulRatio * 0.6);
+
+        if (wordStats.meaningfulCount < 2) {
+            wordQualityMultiplier -= 0.2;
+        }
+
+        if ((wordStats.commonCount || 0) >= (wordStats.meaningfulCount || 0)) {
+            wordQualityMultiplier -= 0.25;
+        }
+
+        wordQualityMultiplier = Math.max(0.45, Math.min(1.2, wordQualityMultiplier));
+
+        const ngramLength = entry.ngramLength || totalWords || NGRAM_MIN;
+        const lengthFactor = 1 + Math.min(Math.max(ngramLength - NGRAM_MIN, 0), 6) * 0.08;
+        const chunkFactor = chunkType === 'narration' ? 1.08 : 1;
+
+        const baseStrength = Math.pow(distinctMessages, 1.2) * 1.5;
+        const baseScore = baseStrength * wordQualityMultiplier * lengthFactor * chunkFactor;
+
+        let repetitionBoost = 0;
+        if (averageOccurrences > 1) {
+            repetitionBoost = Math.min(4, Math.log2(Math.max(averageOccurrences, 1.0001)) * 2.5);
+        }
+
+        const blacklistBonus = this.getBlacklistWeight(entry.original || '') * 0.6;
+
+        const finalScore = Math.max(0, baseScore + repetitionBoost + blacklistBonus);
+
+        return Number.isFinite(finalScore) ? finalScore : 0;
     }
 
     getBlacklistWeight(phrase) {
@@ -196,6 +280,7 @@ export class Analyzer {
         // Use current settings values, not fallback defaults
         const NGRAM_MAX = this.settings.ngramMax;
         const SLOP_THRESHOLD = this.settings.slopThreshold;
+        const userWhitelistSet = new Set((this.settings.whitelist || []).map(w => w.toLowerCase()));
 
         // Debug log settings values occasionally
         if (this.totalAiMessagesProcessed % 50 === 0) {
@@ -230,38 +315,50 @@ export class Analyzer {
                     const originalNgram = originalNgrams[i];
                     const lemmatizedNgram = lemmatizedNgrams[i];
 
-                    if (this.isPhraseLowQuality(originalNgram)) {
+                    const wordStats = this.getWordStats(originalNgram, userWhitelistSet);
+                    if (this.isPhraseLowQuality(wordStats)) {
                         continue;
                     }
 
-                    const currentData = this.ngramFrequencies.get(lemmatizedNgram) || { count: 0, score: 0, lastSeenMessageIndex: this.totalAiMessagesProcessed, original: originalNgram, contextSentence: sentence };
+                    const currentMessageIndex = this.totalAiMessagesProcessed;
+                    let entry = this.ngramFrequencies.get(lemmatizedNgram);
 
-                    let scoreIncrement = 1.0;
-
-                    scoreIncrement += (n - NGRAM_MIN) * 0.2;
-                    // Only use common words for scoring (not names or user whitelist)
-                    const uncommonWordCount = originalNgram.split(' ').reduce((count, word) => count + (commonWords.has(word.toLowerCase()) ? 0 : 1), 0);
-                    scoreIncrement += uncommonWordCount * 0.5;
-                    scoreIncrement += this.getBlacklistWeight(originalNgram);
-                    if (chunkType === 'narration') {
-                        scoreIncrement *= 1.25;
+                    if (!entry) {
+                        entry = {
+                            count: 0,
+                            score: 0,
+                            messageIds: new Set(),
+                            messageCount: 0,
+                            lastSeenMessageIndex: currentMessageIndex,
+                            original: originalNgram,
+                            contextSentence: sentence,
+                            wordStats,
+                            ngramLength: wordStats.total || n,
+                        };
+                        this.ngramFrequencies.set(lemmatizedNgram, entry);
+                    } else {
+                        entry.wordStats = wordStats;
+                        entry.ngramLength = wordStats.total || entry.ngramLength || n;
                     }
 
-                    const newCount = currentData.count + 1;
-                    let newScore = currentData.score + scoreIncrement;
+                    const isNewMessageOccurrence = !entry.messageIds.has(currentMessageIndex);
 
-                    // OPTIMIZATION: Skip expensive boosting logic for performance
-                    // The pattern merging algorithm already handles relationships between n-grams
+                    if (isNewMessageOccurrence) {
+                        entry.messageIds.add(currentMessageIndex);
+                        entry.messageCount = entry.messageIds.size;
+                    } else if (!entry.messageCount && entry.messageIds) {
+                        entry.messageCount = entry.messageIds.size;
+                    }
+                    entry.count = (entry.count || 0) + 1;
+                    entry.lastSeenMessageIndex = currentMessageIndex;
+                    entry.original = originalNgram;
+                    entry.contextSentence = sentence;
+                    entry.wordStats = wordStats;
 
-                    this.ngramFrequencies.set(lemmatizedNgram, {
-                        count: newCount,
-                        score: newScore,
-                        lastSeenMessageIndex: this.totalAiMessagesProcessed,
-                        original: originalNgram,
-                        contextSentence: sentence,
-                    });
+                    const previousScore = entry.score || 0;
+                    entry.score = this.calculateEntryScore(entry, wordStats, chunkType);
 
-                    if (newScore >= SLOP_THRESHOLD && currentData.score < SLOP_THRESHOLD) {
+                    if (entry.score >= SLOP_THRESHOLD && previousScore < SLOP_THRESHOLD) {
                         this.processNewSlopCandidate(lemmatizedNgram);
                     }
                 }
@@ -317,14 +414,70 @@ export class Analyzer {
         }
     }
 
+    filterRedundantVariations(variationSet) {
+        if (!variationSet || variationSet.size <= 1) {
+            return new Set(variationSet);
+        }
+
+        const variations = Array.from(variationSet).filter(v => typeof v === 'string' && v.trim().length > 0);
+        if (variations.length <= 1) {
+            return new Set(variations);
+        }
+
+        // Sort by word-length descending to prioritize more specific suffixes first
+        variations.sort((a, b) => {
+            const aWords = a.split(' ').filter(Boolean).length;
+            const bWords = b.split(' ').filter(Boolean).length;
+            if (bWords !== aWords) return bWords - aWords;
+            return b.length - a.length;
+        });
+
+        const keptVariations = [];
+        const keptWordLists = [];
+
+        for (const variation of variations) {
+            const words = variation.split(' ').filter(Boolean);
+            let isCovered = false;
+
+            for (const existingWords of keptWordLists) {
+                if (existingWords.length < words.length) {
+                    continue;
+                }
+
+                let matches = true;
+                for (let i = 0; i < words.length; i++) {
+                    if (existingWords[i] !== words[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches) {
+                    isCovered = true;
+                    break;
+                }
+            }
+
+            if (!isCovered) {
+                keptVariations.push(variation);
+                keptWordLists.push(words);
+            }
+        }
+
+        return new Set(keptVariations);
+    }
+
     mergeRelatedPatterns(patterns) {
         // Convert patterns to an array for processing
-        const patternArray = Object.entries(patterns).map(([pattern, score]) => {
+        const patternArray = Object.entries(patterns).map(([pattern, data]) => {
             const [prefix, variationsStr] = pattern.split('|');
             return {
                 prefix: prefix.trim(),
                 variations: variationsStr ? variationsStr.split('/').map(v => v.trim()) : [],
-                score: score,
+                score: data?.score ?? 0,
+                messageIds: new Set(data?.messageIds || []),
+                occurrences: data?.occurrences ?? 0,
+                variationCount: Math.max(1, data?.variationCount ?? ((variationsStr ? variationsStr.split('/').length : 0) || 1)),
                 fullPattern: pattern
             };
         });
@@ -341,7 +494,10 @@ export class Analyzer {
             const basePattern = patternArray[i];
             let combinedVariations = new Set(basePattern.variations);
             let totalScore = basePattern.score;
+            let totalOccurrences = basePattern.occurrences;
+            const combinedMessageIds = new Set(basePattern.messageIds);
             let shortestPrefix = basePattern.prefix;
+            let totalVariationCount = basePattern.variationCount || Math.max(1, basePattern.variations.length);
 
             // Find all patterns that contain this prefix
             for (let j = 0; j < patternArray.length; j++) {
@@ -361,17 +517,46 @@ export class Analyzer {
                     // Combine all variations
                     otherPattern.variations.forEach(v => combinedVariations.add(v));
                     totalScore += otherPattern.score;
+                    totalOccurrences += otherPattern.occurrences;
+                    if (otherPattern.messageIds && typeof otherPattern.messageIds.forEach === 'function') {
+                        otherPattern.messageIds.forEach(id => combinedMessageIds.add(id));
+                    }
+                    totalVariationCount += otherPattern.variationCount || Math.max(1, otherPattern.variations.length);
                     consumedPatterns.add(j);
                 }
             }
 
-            // Only create a merged pattern if we have variations
-            if (combinedVariations.size > 0) {
-                const mergedPattern = `${shortestPrefix}|${Array.from(combinedVariations).join('/')}`;
-                mergedResults[mergedPattern] = totalScore;
+            const dedupedVariations = this.filterRedundantVariations(combinedVariations);
+
+            // Only create a merged pattern if we still have variations after deduplication
+            if (dedupedVariations.size > 0) {
+                const mergedPattern = `${shortestPrefix}|${Array.from(dedupedVariations).join('/')}`;
+                const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : combinedMessageIds.size;
+                const cappedMessageIds = new Set();
+                for (const id of combinedMessageIds) {
+                    if (cappedMessageIds.size >= messageCap) break;
+                    cappedMessageIds.add(id);
+                }
+                mergedResults[mergedPattern] = {
+                    score: totalScore,
+                    messageIds: cappedMessageIds,
+                    occurrences: totalOccurrences,
+                    variationCount: Math.max(1, totalVariationCount),
+                };
             } else {
                 // Keep the original pattern
-                mergedResults[basePattern.fullPattern] = basePattern.score;
+                const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : combinedMessageIds.size;
+                const cappedMessageIds = new Set();
+                for (const id of combinedMessageIds) {
+                    if (cappedMessageIds.size >= messageCap) break;
+                    cappedMessageIds.add(id);
+                }
+                mergedResults[basePattern.fullPattern] = {
+                    score: basePattern.score,
+                    messageIds: cappedMessageIds,
+                    occurrences: basePattern.occurrences,
+                    variationCount: Math.max(1, basePattern.variationCount || basePattern.variations.length || 1),
+                };
             }
         }
 
@@ -385,48 +570,89 @@ export class Analyzer {
         }
 
         const PATTERN_MIN_COMMON_WORDS = this.settings.patternMinCommon;
-        const phraseScoreMap = {};
+        const phraseStatsMap = {};
+
         for (const data of Object.values(frequenciesObjectWithOriginals)) {
-            phraseScoreMap[data.original] = (phraseScoreMap[data.original] || 0) + data.score;
+            if (!data || !data.original) continue;
+
+            const originalPhrase = data.original;
+            if (!phraseStatsMap[originalPhrase]) {
+                phraseStatsMap[originalPhrase] = {
+                    score: 0,
+                    occurrences: 0,
+                    messageIds: new Set(),
+                };
+            }
+
+            phraseStatsMap[originalPhrase].score += data.score || 0;
+            phraseStatsMap[originalPhrase].occurrences += data.count || 0;
+
+            if (data.messageIds && typeof data.messageIds.forEach === 'function') {
+                data.messageIds.forEach(id => phraseStatsMap[originalPhrase].messageIds.add(id));
+            } else if (Number.isFinite(data.lastSeenMessageIndex)) {
+                phraseStatsMap[originalPhrase].messageIds.add(data.lastSeenMessageIndex);
+            }
         }
 
-        // Apply substring culling to remove redundant shorter phrases
-        const culledPhrases = cullSubstrings(phraseScoreMap);
+        if (Object.keys(phraseStatsMap).length === 0) {
+            return { merged: {}, remaining: {} };
+        }
 
-        // Then work with the culled phrases for pattern detection
-        const candidates = Object.entries(culledPhrases).sort((a, b) => a[0].localeCompare(b[0]));
+        // Apply substring culling to remove redundant shorter phrases (based on score)
+        const scoreOnlyMap = {};
+        for (const [phrase, stats] of Object.entries(phraseStatsMap)) {
+            scoreOnlyMap[phrase] = stats.score;
+        }
+        const culledScores = cullSubstrings(scoreOnlyMap);
+
+        const culledStats = {};
+        for (const phrase of Object.keys(culledScores)) {
+            if (phraseStatsMap[phrase]) {
+                culledStats[phrase] = phraseStatsMap[phrase];
+            }
+        }
+
+        const candidateEntries = Object.entries(culledStats).sort((a, b) => a[0].localeCompare(b[0]));
+        const candidates = candidateEntries.map(([phrase, stats], idx) => ({
+            index: idx,
+            phrase,
+            score: stats.score,
+            messageIds: new Set(stats.messageIds || []),
+            occurrences: stats.occurrences,
+        }));
+
         const mergedPatterns = {};
         const consumedIndices = new Set();
 
         // Group phrases by length first - only merge phrases of the same length
         const phrasesByLength = {};
-        candidates.forEach(([phrase, score], index) => {
-            const length = phrase.split(' ').length;
+        candidates.forEach(candidate => {
+            const length = candidate.phrase.split(' ').length;
             if (!phrasesByLength[length]) {
                 phrasesByLength[length] = [];
             }
-            phrasesByLength[length].push({ index, phrase, score });
+            phrasesByLength[length].push(candidate);
         });
 
         // Process each length group to find patterns
         // OPTIMIZATION: Limit pattern detection to reasonable phrase lengths (3-10 words)
         for (const [length, lengthGroup] of Object.entries(phrasesByLength)) {
             if (lengthGroup.length < 2) continue; // Need at least 2 phrases to form a pattern
-            if (parseInt(length) > 10) continue; // Skip very long phrases for performance
+            if (parseInt(length, 10) > 10) continue; // Skip very long phrases for performance
 
             for (let i = 0; i < lengthGroup.length; i++) {
-                if (consumedIndices.has(lengthGroup[i].index)) continue;
+                const baseCandidate = lengthGroup[i];
+                if (consumedIndices.has(baseCandidate.index)) continue;
 
-                const phraseA = lengthGroup[i].phrase;
-                const wordsA = phraseA.split(' ');
-                let currentGroup = [lengthGroup[i]];
+                const wordsA = baseCandidate.phrase.split(' ');
+                let currentGroup = [baseCandidate];
 
                 // Find other phrases with the same length that share a common prefix
                 for (let j = i + 1; j < lengthGroup.length; j++) {
-                    if (consumedIndices.has(lengthGroup[j].index)) continue;
+                    const candidateB = lengthGroup[j];
+                    if (consumedIndices.has(candidateB.index)) continue;
 
-                    const phraseB = lengthGroup[j].phrase;
-                    const wordsB = phraseB.split(' ');
+                    const wordsB = candidateB.phrase.split(' ');
 
                     // Count common prefix words
                     let commonPrefixLength = 0;
@@ -441,7 +667,7 @@ export class Analyzer {
                     // Only group if they share enough prefix and have different endings
                     if (commonPrefixLength >= PATTERN_MIN_COMMON_WORDS &&
                         commonPrefixLength < wordsA.length) { // Ensure there's a variation part
-                        currentGroup.push(lengthGroup[j]);
+                        currentGroup.push(candidateB);
                     }
                 }
 
@@ -465,9 +691,15 @@ export class Analyzer {
                         const commonPrefix = currentGroup[0].phrase.split(' ').slice(0, commonPrefixLength).join(' ');
                         const variations = new Set();
                         let totalScore = 0;
+                        let totalOccurrences = 0;
+                        const totalMessageIds = new Set();
 
                         currentGroup.forEach(item => {
                             totalScore += item.score;
+                            totalOccurrences += item.occurrences || 0;
+                            if (item.messageIds && typeof item.messageIds.forEach === 'function') {
+                                item.messageIds.forEach(id => totalMessageIds.add(id));
+                            }
                             consumedIndices.add(item.index);
                             const variationPart = item.phrase.split(' ').slice(commonPrefixLength).join(' ').trim();
                             if (variationPart) {
@@ -475,9 +707,23 @@ export class Analyzer {
                             }
                         });
 
-                        if (variations.size > 1) { // Only create pattern if there are actual variations
-                            const pattern = `${commonPrefix}|${Array.from(variations).join('/')}`;
-                            mergedPatterns[pattern] = (mergedPatterns[pattern] || 0) + totalScore;
+                        const cleanedVariations = this.filterRedundantVariations(variations);
+
+                        if (cleanedVariations.size > 1) { // Only create pattern if there are actual variations
+                            const pattern = `${commonPrefix}|${Array.from(cleanedVariations).join('/')}`;
+                            const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : totalMessageIds.size;
+
+                            if (!mergedPatterns[pattern]) {
+                                mergedPatterns[pattern] = { score: 0, occurrences: 0, messageIds: new Set(), variationCount: 0 };
+                            }
+
+                            mergedPatterns[pattern].score += totalScore;
+                            mergedPatterns[pattern].occurrences += totalOccurrences;
+                            mergedPatterns[pattern].variationCount += Math.max(1, cleanedVariations.size);
+                            totalMessageIds.forEach(id => {
+                                if (mergedPatterns[pattern].messageIds.size >= messageCap) return;
+                                mergedPatterns[pattern].messageIds.add(id);
+                            });
                         }
                     }
                 }
@@ -500,17 +746,54 @@ export class Analyzer {
             const standaloneThreshold = (this.settings.slopThreshold || 5) * STANDALONE_THRESHOLD_MULTIPLIER;
 
             for (let i = 0; i < candidates.length; i++) {
-                if (!consumedIndices.has(i)) {
-                    const [phrase, score] = candidates[i];
-                    // Only include if it's really significant on its own
-                    if (score >= standaloneThreshold) {
-                        remaining[phrase] = score;
-                    }
+                const candidate = candidates[i];
+                if (consumedIndices.has(candidate.index)) continue;
+
+                if (candidate.score >= standaloneThreshold) {
+                    remaining[candidate.phrase] = {
+                        score: candidate.score,
+                        messageCount: candidate.messageIds ? candidate.messageIds.size : 0,
+                        occurrences: candidate.occurrences,
+                    };
                 }
             }
         }
 
-        return { merged: finalMergedPatterns, remaining: remaining };
+        const normalizedMerged = {};
+        for (const [pattern, data] of Object.entries(finalMergedPatterns)) {
+            const messageCount = data?.messageIds && typeof data.messageIds.size === 'number'
+                ? data.messageIds.size
+                : (data?.messageCount ?? 0);
+            if (!Number.isFinite(messageCount) || messageCount <= 1) {
+                continue;
+            }
+            const variationCount = Math.max(1, data?.variationCount ?? 1);
+            const rawScore = Number(data?.score ?? 0);
+            const normalizedScore = Number.isFinite(rawScore)
+                ? rawScore / Math.sqrt(variationCount)
+                : 0;
+            normalizedMerged[pattern] = {
+                score: Number.isFinite(normalizedScore) ? normalizedScore : 0,
+                messageCount,
+                occurrences: data?.occurrences ?? 0,
+                variationCount,
+            };
+        }
+
+        const normalizedRemaining = {};
+        for (const [phrase, data] of Object.entries(remaining)) {
+            const messageCount = data?.messageCount ?? 0;
+            if (!Number.isFinite(messageCount) || messageCount <= 1) {
+                continue;
+            }
+            normalizedRemaining[phrase] = {
+                score: data?.score ?? 0,
+                messageCount,
+                occurrences: data?.occurrences ?? 0,
+            };
+        }
+
+        return { merged: normalizedMerged, remaining: normalizedRemaining };
     }
 
 
@@ -551,8 +834,8 @@ export class Analyzer {
         
         const { merged, remaining } = this.findAndMergePatterns(limitedCandidates);
         
-        const mergedEntries = Object.entries(merged).sort((a, b) => b[1] - a[1]);
-        const allRemainingEntries = Object.entries(remaining).sort((a, b) => b[1] - a[1]);
+        const mergedEntries = Object.entries(merged).sort((a, b) => (b[1]?.score ?? 0) - (a[1]?.score ?? 0));
+        const allRemainingEntries = Object.entries(remaining).sort((a, b) => (b[1]?.score ?? 0) - (a[1]?.score ?? 0));
         
         this.analyzedLeaderboardData = {
             merged: Object.fromEntries(mergedEntries),
@@ -568,20 +851,33 @@ export class Analyzer {
 
         if (isProcessedDataAvailable) {
             // Path 1: Show the fully processed, patterned data (the best view)
-            const mergedRows = Object.entries(mergedEntries).map(([phrase, score]) => {
+            const mergedRows = Object.entries(mergedEntries).map(([phrase, data]) => {
+                const scoreValue = Number(data?.score ?? 0);
+                const responseCountSource = data?.messageCount ?? (data?.messageIds && typeof data.messageIds.size === 'number' ? data.messageIds.size : 0);
+                const responseCountValue = Number(responseCountSource);
+                const safeScore = Number.isFinite(scoreValue) ? scoreValue : 0;
+                const safeResponseCount = Number.isFinite(responseCountValue) ? Math.max(0, Math.round(responseCountValue)) : 0;
+
                 // Format patterns with | separator for better display
                 let displayPhrase = phrase;
                 if (phrase.includes('|')) {
                     const [template, variations] = phrase.split('|');
                     displayPhrase = `${template.trim()} [${variations}]`;
                 }
-                return `<tr class="is-pattern"><td>${this.escapeHtml(displayPhrase)}</td><td>${score.toFixed(1)}</td></tr>`;
+                return `<tr class="is-pattern"><td>${this.escapeHtml(displayPhrase)}</td><td>${safeResponseCount}</td><td>${safeScore.toFixed(1)}</td></tr>`;
             }).join('');
-            const remainingRows = Object.entries(remainingEntries).map(([phrase, score]) => `<tr><td>${this.escapeHtml(phrase)}</td><td>${score.toFixed(1)}</td></tr>`).join('');
+            const remainingRows = Object.entries(remainingEntries).map(([phrase, data]) => {
+                const scoreValue = Number(data?.score ?? 0);
+                const responseCountSource = data?.messageCount ?? (data?.messageIds && typeof data.messageIds.size === 'number' ? data.messageIds.size : 0);
+                const responseCountValue = Number(responseCountSource);
+                const safeScore = Number.isFinite(scoreValue) ? scoreValue : 0;
+                const safeResponseCount = Number.isFinite(responseCountValue) ? Math.max(0, Math.round(responseCountValue)) : 0;
+                return `<tr><td>${this.escapeHtml(phrase)}</td><td>${safeResponseCount}</td><td>${safeScore.toFixed(1)}</td></tr>`;
+            }).join('');
             
             contentHtml = `<p>Showing <strong>processed and patterned</strong> slop data. Phrases in <strong>bold orange</strong> are detected patterns. This list updates automatically every 10 messages.</p>
                            <table class="prose-polisher-frequency-table">
-                               <thead><tr><th>Repetitive Phrase or Pattern</th><th>Slop Score</th></tr></thead>
+                               <thead><tr><th>Repetitive Phrase or Pattern</th><th>Responses</th><th>Slop Score</th></tr></thead>
                                <tbody>${mergedRows}${remainingRows}</tbody>
                            </table>`;
         } else if (this.ngramFrequencies.size > 0) {
@@ -590,11 +886,18 @@ export class Analyzer {
                 .filter(data => data.score > 0) // Only show items with a score
                 .sort((a, b) => b.score - a.score);
 
-            const rawRows = rawEntries.map(data => `<tr><td>${this.escapeHtml(data.original)}</td><td>${data.score.toFixed(1)}</td></tr>`).join('');
+            const rawRows = rawEntries.map(data => {
+                const scoreValue = Number(data?.score ?? 0);
+                const responseCountSource = data?.messageCount ?? (data?.messageIds && typeof data.messageIds.size === 'number' ? data.messageIds.size : 0);
+                const responseCountValue = Number(responseCountSource);
+                const safeScore = Number.isFinite(scoreValue) ? scoreValue : 0;
+                const safeResponseCount = Number.isFinite(responseCountValue) ? Math.max(0, Math.round(responseCountValue)) : 0;
+                return `<tr><td>${this.escapeHtml(data.original)}</td><td>${safeResponseCount}</td><td>${safeScore.toFixed(1)}</td></tr>`;
+            }).join('');
             
             contentHtml = `<p>Showing <strong>raw, unprocessed</strong> n-grams detected so far. This data is collected on every AI message and will be processed into patterns periodically.</p>
                            <table class="prose-polisher-frequency-table">
-                               <thead><tr><th>Detected Phrase</th><th>Slop Score</th></tr></thead>
+                               <thead><tr><th>Detected Phrase</th><th>Responses</th><th>Slop Score</th></tr></thead>
                                <tbody>${rawRows}</tbody>
                            </table>`;
         } else {
@@ -775,7 +1078,8 @@ export class Analyzer {
         const slopList = [];
         
         // Add merged patterns that exceed threshold
-        for (const [pattern, score] of Object.entries(latestData.merged || {})) {
+        for (const [pattern, data] of Object.entries(latestData.merged || {})) {
+            const score = data?.score ?? 0;
             if (score >= SLOP_THRESHOLD) {
                 // Check if this is a pattern with variations (uses | separator)
                 if (pattern.includes('|')) {
@@ -811,7 +1115,8 @@ export class Analyzer {
         }
         
         // Add remaining individual phrases that exceed threshold
-        for (const [phrase, score] of Object.entries(latestData.remaining || {})) {
+        for (const [phrase, data] of Object.entries(latestData.remaining || {})) {
+            const score = data?.score ?? 0;
             if (score >= SLOP_THRESHOLD) {
                 slopList.push({
                     phrase: phrase,
