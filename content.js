@@ -31,6 +31,14 @@ const defaultSettings = {
     patternMinCommon: 3,
     whitelist: [],
     blacklist: {},
+    // Advanced analysis toggles
+    maskNames: true,
+    enableBigrams: false,
+    allowSkipGrams: true,
+    patternTypes: { prefix: true, suffix: true, middle: true },
+    includeStandalonePhrases: true,
+    useSignificance: true,
+    significanceWeight: 0.2,
     // Performance settings
     autoAnalyze: false, // Disabled by default for performance
     analysisInterval: 50, // Messages between automatic analyses
@@ -60,10 +68,20 @@ function getSettings() {
         delete settings.pruningCycle;
     }
     
-    // Ensure new settings have defaults
-    if (settings.decayRate === undefined) settings.decayRate = 10;
-    if (settings.decayInterval === undefined) settings.decayInterval = 10;
-    
+    // Ensure new settings have defaults (migrate older settings objects)
+    if (settings.decayRate === undefined) settings.decayRate = defaultSettings.decayRate;
+    if (settings.decayInterval === undefined) settings.decayInterval = defaultSettings.decayInterval;
+    if (settings.maskNames === undefined) settings.maskNames = defaultSettings.maskNames;
+    if (settings.enableBigrams === undefined) settings.enableBigrams = defaultSettings.enableBigrams;
+    if (settings.allowSkipGrams === undefined) settings.allowSkipGrams = defaultSettings.allowSkipGrams;
+    if (!settings.patternTypes) settings.patternTypes = structuredClone(defaultSettings.patternTypes);
+    if (settings.includeStandalonePhrases === undefined) settings.includeStandalonePhrases = defaultSettings.includeStandalonePhrases;
+    if (settings.useSignificance === undefined) settings.useSignificance = defaultSettings.useSignificance;
+    if (settings.significanceWeight === undefined) settings.significanceWeight = defaultSettings.significanceWeight;
+    if (settings.autoAnalyze === undefined) settings.autoAnalyze = defaultSettings.autoAnalyze;
+    if (settings.analysisInterval === undefined) settings.analysisInterval = defaultSettings.analysisInterval;
+    if (settings.messageLimit === undefined) settings.messageLimit = defaultSettings.messageLimit;
+
     return settings;
 }
 
@@ -84,7 +102,14 @@ function loadAndApplySettings() {
         slopThreshold: settings.slopThreshold,
         decayRate: settings.decayRate,
         decayInterval: settings.decayInterval,
-        patternMinCommon: settings.patternMinCommon
+        patternMinCommon: settings.patternMinCommon,
+        maskNames: settings.maskNames,
+        enableBigrams: settings.enableBigrams,
+        allowSkipGrams: settings.allowSkipGrams,
+        patternTypes: settings.patternTypes,
+        includeStandalonePhrases: settings.includeStandalonePhrases,
+        useSignificance: settings.useSignificance,
+        significanceWeight: settings.significanceWeight,
     });
 }
 
@@ -104,10 +129,13 @@ function initializeAnalyzer() {
     const updateSlopListMacro = () => {
         if (typeof MacrosParser !== 'undefined' && MacrosParser.registerMacro) {
             try {
+                // Refresh cache first; macro returns cached JSON string to avoid heavy work at expansion time
+                if (prosePolisherAnalyzer && typeof prosePolisherAnalyzer.refreshSlopListCache === 'function') {
+                    prosePolisherAnalyzer.refreshSlopListCache();
+                }
                 MacrosParser.registerMacro('slopList', () => {
                     try {
-                        const list = prosePolisherAnalyzer ? prosePolisherAnalyzer.getSlopList() : [];
-                        return JSON.stringify(list);
+                        return prosePolisherAnalyzer?.slopListCacheString || '[]';
                     } catch (innerErr) {
                         console.error(`${LOG_PREFIX} Error generating slopList macro content:`, innerErr);
                         return '[]';
@@ -434,7 +462,125 @@ function setupUI() {
             }
         });
     });
-    
+
+    // Advanced analysis toggles UI
+    // Inject controls after existing Performance Settings block
+    const advancedHtml = `
+        <h3>Advanced Analysis</h3>
+        <div class="prose-polisher-settings-group">
+            <label class="checkbox_label" for="pp-mask-names">
+                <input type="checkbox" id="pp-mask-names" ${getSettings().maskNames ? 'checked' : ''}>
+                <span>Mask names/whitelist as placeholders</span>
+            </label>
+            <label class="checkbox_label" for="pp-enable-bigrams">
+                <input type="checkbox" id="pp-enable-bigrams" ${getSettings().enableBigrams ? 'checked' : ''}>
+                <span>Enable bigram tics (significance-weighted)</span>
+            </label>
+            <label class="checkbox_label" for="pp-allow-skipgrams">
+                <input type="checkbox" id="pp-allow-skipgrams" ${getSettings().allowSkipGrams ? 'checked' : ''}>
+                <span>Allow skip-gram modifiers when matching</span>
+            </label>
+            <label class="checkbox_label" for="pp-use-significance">
+                <input type="checkbox" id="pp-use-significance" ${getSettings().useSignificance ? 'checked' : ''}>
+                <span>Use significance weighting (PMI)</span>
+            </label>
+            <div class="range-block">
+                <label for="pp-significance-weight" title="Weight of significance signal in final score">
+                    <span>Significance Weight</span>
+                </label>
+                <div class="alignitemscenter flex-container flexFlowColumn flexBasis30p flexGrow flexShrink gap0">
+                    <input type="range" id="pp-significance-weight" class="neo-range-slider" min="0" max="0.6" value="${getSettings().significanceWeight}" step="0.05">
+                    <input type="number" id="pp-significance-weight-counter" class="neo-range-input" min="0" max="0.6" value="${getSettings().significanceWeight}" step="0.05">
+                </div>
+            </div>
+            <div class="flex-container flexGap10">
+                <div>
+                    <strong>Pattern Types:</strong>
+                </div>
+                <label class="checkbox_label" for="pp-pattern-prefix">
+                    <input type="checkbox" id="pp-pattern-prefix" ${getSettings().patternTypes?.prefix ? 'checked' : ''}>
+                    <span>Prefix</span>
+                </label>
+                <label class="checkbox_label" for="pp-pattern-suffix">
+                    <input type="checkbox" id="pp-pattern-suffix" ${getSettings().patternTypes?.suffix ? 'checked' : ''}>
+                    <span>Suffix</span>
+                </label>
+                <label class="checkbox_label" for="pp-pattern-middle">
+                    <input type="checkbox" id="pp-pattern-middle" ${getSettings().patternTypes?.middle ? 'checked' : ''}>
+                    <span>Middle slot</span>
+                </label>
+            </div>
+            <label class="checkbox_label" for="pp-include-standalone">
+                <input type="checkbox" id="pp-include-standalone" ${getSettings().includeStandalonePhrases ? 'checked' : ''}>
+                <span>Include standalone phrases (stricter threshold)</span>
+            </label>
+        </div>`;
+    $(advancedHtml).insertAfter($('#extensions_settings .prose-polisher-settings-group').last());
+
+    $('#pp-mask-names').on('change', function() {
+        const settings = getSettings();
+        settings.maskNames = $(this).prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated maskNames to ${settings.maskNames}`);
+    });
+
+    $('#pp-enable-bigrams').on('change', function() {
+        const settings = getSettings();
+        settings.enableBigrams = $(this).prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated enableBigrams to ${settings.enableBigrams}`);
+    });
+
+    $('#pp-allow-skipgrams').on('change', function() {
+        const settings = getSettings();
+        settings.allowSkipGrams = $(this).prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated allowSkipGrams to ${settings.allowSkipGrams}`);
+    });
+
+    $('#pp-use-significance').on('change', function() {
+        const settings = getSettings();
+        settings.useSignificance = $(this).prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated useSignificance to ${settings.useSignificance}`);
+    });
+
+    $('#pp-significance-weight, #pp-significance-weight-counter').on('input', function() {
+        const slider = $('#pp-significance-weight');
+        const input = $('#pp-significance-weight-counter');
+        const value = parseFloat($(this).val());
+        slider.val(value);
+        input.val(value);
+        const settings = getSettings();
+        settings.significanceWeight = Math.max(0, Math.min(0.6, value));
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated significanceWeight to ${settings.significanceWeight}`);
+    });
+
+    $('#pp-pattern-prefix, #pp-pattern-suffix, #pp-pattern-middle').on('change', function() {
+        const settings = getSettings();
+        settings.patternTypes = settings.patternTypes || { prefix: true, suffix: true, middle: true };
+        settings.patternTypes.prefix = $('#pp-pattern-prefix').prop('checked');
+        settings.patternTypes.suffix = $('#pp-pattern-suffix').prop('checked');
+        settings.patternTypes.middle = $('#pp-pattern-middle').prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated patternTypes to`, settings.patternTypes);
+    });
+
+    $('#pp-include-standalone').on('change', function() {
+        const settings = getSettings();
+        settings.includeStandalonePhrases = $(this).prop('checked');
+        saveSettingsDebounced();
+        if (prosePolisherAnalyzer) prosePolisherAnalyzer.settings = settings;
+        console.log(`${LOG_PREFIX} Updated includeStandalonePhrases to ${settings.includeStandalonePhrases}`);
+    });
+
     $('#pp-pattern-min-common-counter').on('input', function() {
         const value = parseInt($(this).val());
         $('#pp-pattern-min-common').val(value);
@@ -543,7 +689,7 @@ function setupUI() {
         if (prosePolisherAnalyzer) {
             prosePolisherAnalyzer.clearFrequencyData();
             // Ensure macro remains registered dynamically (will return [] until data exists)
-            updateSlopListMacro();
+            prosePolisherAnalyzer.updateSlopListMacro?.();
         }
     });
     
@@ -682,6 +828,10 @@ async function performSilentChatAnalysis() {
         prosePolisherAnalyzer.messageCounterForTrigger = 0;
         prosePolisherAnalyzer.totalAiMessagesProcessed = 0;
         prosePolisherAnalyzer.lastAnalysisMessageCount = 0;
+        if (prosePolisherAnalyzer.unigramCounts) prosePolisherAnalyzer.unigramCounts.clear();
+        if (prosePolisherAnalyzer.bigramCounts) prosePolisherAnalyzer.bigramCounts.clear();
+        prosePolisherAnalyzer.totalUnigrams = 0;
+        prosePolisherAnalyzer.totalBigrams = 0;
         if (prosePolisherAnalyzer.updateSlopListMacro) {
             prosePolisherAnalyzer.updateSlopListMacro();
         }
@@ -692,12 +842,19 @@ async function performSilentChatAnalysis() {
         console.log(`${LOG_PREFIX} Performing silent analysis on limited data set (${aiMessageCount} AI messages). Results may be noisy.`);
     }
 
-    try {
-        // Clear existing data
-        prosePolisherAnalyzer.ngramFrequencies.clear();
-        prosePolisherAnalyzer.slopCandidates.clear();
-        prosePolisherAnalyzer.totalAiMessagesProcessed = 0;
-        prosePolisherAnalyzer.lastAnalysisMessageCount = 0; // Reset analysis tracking
+        try {
+            // Clear existing data
+            prosePolisherAnalyzer.ngramFrequencies.clear();
+            prosePolisherAnalyzer.slopCandidates.clear();
+            prosePolisherAnalyzer.totalAiMessagesProcessed = 0;
+            prosePolisherAnalyzer.lastAnalysisMessageCount = 0; // Reset analysis tracking
+            if (prosePolisherAnalyzer.unigramCounts) prosePolisherAnalyzer.unigramCounts.clear();
+            if (prosePolisherAnalyzer.bigramCounts) prosePolisherAnalyzer.bigramCounts.clear();
+            prosePolisherAnalyzer.totalUnigrams = 0;
+            prosePolisherAnalyzer.totalBigrams = 0;
+            if (prosePolisherAnalyzer.aliasKeyToBaseKey) prosePolisherAnalyzer.aliasKeyToBaseKey.clear();
+            prosePolisherAnalyzer.pmiRunningMean = 0;
+            prosePolisherAnalyzer.pmiCount = 0;
         
         let chatMessages = context.chat;
         
@@ -778,7 +935,7 @@ jQuery(async () => {
             if (prosePolisherAnalyzer) {
                 prosePolisherAnalyzer.clearFrequencyData();
                 // Ensure macro remains registered dynamically (returns [] until new data)
-                updateSlopListMacro();
+                prosePolisherAnalyzer.updateSlopListMacro?.();
                 console.log(`${LOG_PREFIX} Chat changed, cleared data and reset macro`);
             }
         });

@@ -12,7 +12,13 @@ const EXTENSION_FOLDER_PATH = `scripts/extensions/third-party/ProsePolisher`;
 
 // Constants
 const CANDIDATE_LIMIT_FOR_ANALYSIS = 2000;
-const NGRAM_MIN = 3; // The minimum n-gram size is fundamental to the logic.
+const NGRAM_MIN = 3; // Default minimum n-gram size when bigrams disabled.
+const PRONOUNS = new Set(['i','you','he','she','we','they','me','him','her','us','them','my','your','his','her','our','their','mine','yours','hers','ours','theirs']);
+const DEFAULT_SKIP_MODIFIERS = new Set([
+    'very','really','just','quite','little','softly','slowly','right','even','almost','nearly','barely','simply','rather','somewhat','truly','gently','suddenly',
+    // Determiners/function words to reduce trivial variant noise
+    'the','a','an','of'
+]);
 
 // Utility Functions
 function stripMarkup(text) {
@@ -101,6 +107,35 @@ function buildPhraseTrie(phraseStatsMap) {
 
         let node = root;
         for (const token of tokens) {
+            if (!node.children.has(token)) {
+                const childTokens = node.tokens.length ? [...node.tokens, token] : [token];
+                node.children.set(token, new PhraseTrieNode(token, node.depth + 1, childTokens));
+            }
+            node = node.children.get(token);
+            node.phraseRefs.push(phraseRef);
+        }
+        node.isTerminal = true;
+    }
+    return root;
+}
+
+function buildSuffixTrie(phraseStatsMap) {
+    const root = new PhraseTrieNode('', 0, []);
+    for (const [phrase, stats] of Object.entries(phraseStatsMap)) {
+        if (!phrase || !stats) continue;
+        const tokens = phrase.split(' ').filter(Boolean);
+        if (tokens.length === 0) continue;
+
+        const reversed = [...tokens].reverse();
+        const phraseRef = {
+            phrase,
+            tokens,
+            reversedTokens: reversed,
+            stats,
+        };
+
+        let node = root;
+        for (const token of reversed) {
             if (!node.children.has(token)) {
                 const childTokens = node.tokens.length ? [...node.tokens, token] : [token];
                 node.children.set(token, new PhraseTrieNode(token, node.depth + 1, childTokens));
@@ -203,6 +238,94 @@ function collectPatternCandidatesFromTrie(root, minCommonWords, filterVariations
         });
     }
 
+    return candidates;
+}
+
+function collectSuffixPatternCandidatesFromTrie(root, minCommonWords, filterVariations) {
+    const candidates = [];
+    const stack = [...root.children.values()];
+
+    while (stack.length > 0) {
+        const node = stack.pop();
+        node.children.forEach(child => stack.push(child));
+
+        if (node.depth < minCommonWords) continue;
+        if (!node.phraseRefs || node.phraseRefs.length < 2) continue;
+
+        const rawVariations = new Set();
+        const phraseSet = new Set();
+        const phraseTokenMap = new Map();
+        const messageIds = new Set();
+        let totalOccurrences = 0;
+        let scoreSum = 0;
+        let scoreCount = 0;
+        let maxScore = 0;
+
+        const uniquePhraseRefs = new Map();
+        for (const ref of node.phraseRefs) {
+            if (!ref || !ref.tokens || !ref.phrase) continue;
+            if (!uniquePhraseRefs.has(ref.phrase)) {
+                uniquePhraseRefs.set(ref.phrase, ref);
+            }
+        }
+
+        const seenStats = new Set();
+        for (const ref of uniquePhraseRefs.values()) {
+            const suffixDepth = node.depth;
+            const prefixTokens = ref.tokens.slice(0, ref.tokens.length - suffixDepth);
+            if (prefixTokens.length === 0) continue;
+            const variation = prefixTokens.join(' ').trim();
+            if (!variation) continue;
+
+            rawVariations.add(variation);
+            phraseSet.add(ref.phrase);
+            phraseTokenMap.set(ref.phrase, ref.tokens);
+
+            if (!seenStats.has(ref.stats)) {
+                seenStats.add(ref.stats);
+                const scoreValue = Number(ref.stats?.score ?? 0);
+                if (Number.isFinite(scoreValue)) {
+                    scoreSum += scoreValue;
+                    scoreCount++;
+                    maxScore = Math.max(maxScore, scoreValue);
+                }
+                totalOccurrences += ref.stats?.occurrences ?? 0;
+            }
+
+            const ids = ref.stats?.messageIds;
+            if (ids && typeof ids.forEach === 'function') {
+                ids.forEach(id => messageIds.add(id));
+            } else if (Number.isFinite(ref.stats?.lastSeenMessageIndex)) {
+                messageIds.add(ref.stats.lastSeenMessageIndex);
+            }
+        }
+
+        if (rawVariations.size < 2 || phraseSet.size < 2) continue;
+
+        const cleanedVariations = filterVariations(rawVariations);
+        if (!cleanedVariations || cleanedVariations.size < 2) continue;
+
+        const sortedVariations = Array.from(cleanedVariations).sort((a, b) => a.localeCompare(b));
+
+        const averageScore = scoreCount > 0 ? scoreSum / scoreCount : 0;
+        const diversityBonus = rawVariations.size > 1
+            ? Math.min(2, Math.log1p(rawVariations.size - 1) * 0.75)
+            : 0;
+        const candidateScore = Math.min(10, Math.max(maxScore, averageScore + diversityBonus));
+
+        candidates.push({
+            suffix: node.tokens.slice(0, node.depth).reverse().join(' '),
+            suffixTokens: [...node.tokens].slice(0, node.depth).reverse(),
+            variations: sortedVariations, // prefix variants
+            score: candidateScore,
+            occurrences: totalOccurrences,
+            messageIds,
+            variationCount: sortedVariations.length,
+            phraseSet,
+            depth: node.depth,
+            phraseTokenMap,
+        });
+    }
     return candidates;
 }
 
@@ -390,78 +513,265 @@ function filterContainedPatternCandidates(candidates, options = {}) {
     return filtered;
 }
 
-function cullSubstrings(frequenciesObject) {
-    // This function removes overlapping/substring phrases to prevent duplicates
-    // while keeping the highest scoring versions
+// Generic overlap filter across all pattern kinds using phrase-set containment and anchor specificity.
+// Safer than token-shift logic for non-prefix patterns.
+function filterContainedPatternCandidatesGeneric(candidates, options = {}) {
+    const { overlapThreshold = 0.6 } = options;
+    if (!Array.isArray(candidates) || candidates.length <= 1) return candidates || [];
 
-    const culledFrequencies = { ...frequenciesObject };
-    const sortedPhrases = Object.keys(culledFrequencies).sort((a, b) => b.length - a.length);
-    const phrasesToRemove = new Set();
+    const kindRank = { middle: 3, prefix: 2, suffix: 2, other: 1 };
+    const getSpecificity = (c) => {
+        const pre = Array.isArray(c.prefixTokens) ? c.prefixTokens.length : (typeof c.prefix === 'string' ? c.prefix.split(' ').filter(Boolean).length : 0);
+        const suf = Array.isArray(c.suffixTokens) ? c.suffixTokens.length : (typeof c.suffix === 'string' ? c.suffix.split(' ').filter(Boolean).length : 0);
+        const rank = kindRank[c.kind] || kindRank.other;
+        return { rank, tokens: pre + suf };
+    };
 
-    // First pass: Remove exact duplicates, keeping higher scores
-    const phraseMap = new Map();
-    for (const [phrase, score] of Object.entries(culledFrequencies)) {
-        const normalizedPhrase = phrase.toLowerCase().trim();
-        if (phraseMap.has(normalizedPhrase)) {
-            // Keep the one with higher score
-            const existingScore = phraseMap.get(normalizedPhrase).score;
-            if (score <= existingScore) {
-                phrasesToRemove.add(phrase);
-            } else {
-                phrasesToRemove.add(phraseMap.get(normalizedPhrase).phrase);
-                phraseMap.set(normalizedPhrase, { phrase, score });
+    const sorted = [...candidates].sort((a, b) => {
+        // Primary by score
+        const sa = Number(a.score ?? 0), sb = Number(b.score ?? 0);
+        if (sb !== sa) return sb - sa;
+        // Then by variationCount
+        const va = Number(a.variationCount ?? 0), vb = Number(b.variationCount ?? 0);
+        if (vb !== va) return vb - va;
+        // Then by specificity
+        const spA = getSpecificity(a), spB = getSpecificity(b);
+        if (spB.rank !== spA.rank) return spB.rank - spA.rank;
+        if (spB.tokens !== spA.tokens) return spB.tokens - spA.tokens;
+        // Finally by phraseSet size
+        const pa = a.phraseSet ? a.phraseSet.size : 0;
+        const pb = b.phraseSet ? b.phraseSet.size : 0;
+        return pb - pa;
+    });
+
+    const kept = [];
+    for (const cand of sorted) {
+        const cSet = cand.phraseSet || new Set();
+        if (cSet.size === 0) { kept.push(cand); continue; }
+        let dominated = false;
+        for (let i = 0; i < kept.length; i++) {
+            const k = kept[i];
+            const kSet = k.phraseSet || new Set();
+            if (kSet.size === 0) continue;
+            const inter = countSetIntersection(cSet, kSet);
+            const denom = Math.min(cSet.size, kSet.size) || 1;
+            const ratio = inter / denom;
+            if (ratio >= overlapThreshold) {
+                // Prefer more specific per sorted order (kept first). Replace only if cand is clearly better.
+                const spK = getSpecificity(k), spC = getSpecificity(cand);
+                const kScore = Number(k.score ?? 0), cScore = Number(cand.score ?? 0);
+                const kVar = Number(k.variationCount ?? 0), cVar = Number(cand.variationCount ?? 0);
+
+                const candBetter = (
+                    cScore > kScore + 0.25 ||
+                    (Math.abs(cScore - kScore) <= 0.25 && (
+                        spC.rank > spK.rank ||
+                        (spC.rank === spK.rank && spC.tokens > spK.tokens) ||
+                        (spC.rank === spK.rank && spC.tokens === spK.tokens && cVar > kVar)
+                    ))
+                );
+
+                if (candBetter) {
+                    kept.splice(i, 1);
+                    i--;
+                    continue; // re-check against other kept entries
+                } else {
+                    dominated = true;
+                    break;
+                }
             }
-        } else {
-            phraseMap.set(normalizedPhrase, { phrase, score });
         }
+        if (!dominated) kept.push(cand);
+    }
+    return kept;
+}
+
+// Merge pattern objects with high overlap or identical anchors, preferring more specific templates.
+function mergePatternObjects(patterns, filterVariationsFn) {
+    if (!Array.isArray(patterns) || patterns.length <= 1) return patterns || [];
+
+    const kindRank = { middle: 3, prefix: 2, suffix: 2, other: 1 };
+    const specificity = (p) => ({ rank: kindRank[p.kind] || 1, tokens: (p.prefixTokens?.length || 0) + (p.suffixTokens?.length || 0) });
+    const sameAnchor = (a, b) => {
+        const preEq = JSON.stringify(a.prefixTokens || []) === JSON.stringify(b.prefixTokens || []);
+        const sufEq = JSON.stringify(a.suffixTokens || []) === JSON.stringify(b.suffixTokens || []);
+        return (preEq && (a.kind === 'prefix' || a.kind === 'middle') && (b.kind === 'prefix' || b.kind === 'middle')) ||
+               (sufEq && (a.kind === 'suffix' || a.kind === 'middle') && (b.kind === 'suffix' || b.kind === 'middle'));
+    };
+
+    const sorted = [...patterns].sort((a, b) => {
+        const sa = Number(a.score ?? 0), sb = Number(b.score ?? 0);
+        if (sb !== sa) return sb - sa;
+        const va = Number(a.variationCount ?? 0), vb = Number(b.variationCount ?? 0);
+        if (vb !== va) return vb - va;
+        const spA = specificity(a), spB = specificity(b);
+        if (spB.rank !== spA.rank) return spB.rank - spA.rank;
+        if (spB.tokens !== spA.tokens) return spB.tokens - spA.tokens;
+        return (b.phraseSet?.size || 0) - (a.phraseSet?.size || 0);
+    });
+
+    const kept = [];
+
+    const toArrayUniqueSorted = (setOrArr) => Array.from(new Set(Array.isArray(setOrArr) ? setOrArr : (setOrArr || []))).sort((x, y) => x.localeCompare(y));
+    const intersectSets = (A, B) => {
+        const out = new Set();
+        if (!A || !B) return out;
+        for (const x of A) if (B.has(x)) out.add(x);
+        return out;
+    };
+    const extractMiddleFromTokens = (tokens, preTokens, sufTokens) => {
+        if (!Array.isArray(tokens)) return '';
+        const preLen = preTokens?.length || 0;
+        const sufLen = sufTokens?.length || 0;
+        if (tokens.length <= preLen + sufLen) return '';
+        const middleT = tokens.slice(preLen, tokens.length - sufLen);
+        return middleT.join(' ').trim();
+    };
+
+    const unionSets = (A, B) => {
+        const out = new Set(A || []);
+        for (const x of (B || [])) out.add(x);
+        return out;
+    };
+
+    for (const p of sorted) {
+        let merged = false;
+        for (let i = 0; i < kept.length; i++) {
+            const k = kept[i];
+            // PhraseSet overlap ratio
+            const setA = p.phraseSet || new Set();
+            const setB = k.phraseSet || new Set();
+            let inter = 0;
+            if (setA.size && setB.size) {
+                for (const v of setA) if (setB.has(v)) inter++;
+            }
+            const denom = Math.min(setA.size || 0, setB.size || 0) || 1;
+            const overlap = inter / denom;
+
+            const spP = specificity(p);
+            const spK = specificity(k);
+
+            const anchorsEqual = sameAnchor(p, k);
+            const strongOverlap = overlap >= 0.6 || anchorsEqual;
+            if (!strongOverlap) continue;
+
+            // Prefer more specific or merge when same specificity
+            const pBetter = (spP.rank > spK.rank) || (spP.rank === spK.rank && spP.tokens > spK.tokens) || (spP.rank === spK.rank && spP.tokens === spK.tokens && (p.score || 0) > (k.score || 0));
+
+            const base = pBetter ? p : k;
+            const other = pBetter ? k : p;
+
+            // Merge fields
+            // If combining complementary anchors, try to upgrade to a middle-slot template
+            const combinedPre = (base.prefixTokens && base.prefixTokens.length ? base.prefixTokens : other.prefixTokens) || [];
+            const combinedSuf = (base.suffixTokens && base.suffixTokens.length ? base.suffixTokens : other.suffixTokens) || [];
+            let upgradedTemplate = false;
+            if (combinedPre.length && combinedSuf.length) {
+                base.prefixTokens = combinedPre;
+                base.suffixTokens = combinedSuf;
+                base.template = `${combinedPre.join(' ')} {variant} ${combinedSuf.join(' ')}`;
+                base.kind = 'middle';
+                // Build middle variations from phrase intersection
+                const overlapPhrases = intersectSets(base.phraseSet, other.phraseSet);
+                const midVars = new Set();
+                for (const ph of overlapPhrases) {
+                    const toks = (base.phraseTokenMap && base.phraseTokenMap.get(ph)) || (other.phraseTokenMap && other.phraseTokenMap.get(ph));
+                    const m = extractMiddleFromTokens(toks || [], base.prefixTokens, base.suffixTokens);
+                    if (m) midVars.add(m);
+                }
+                if (midVars.size >= 2) {
+                    const cleaned = filterVariationsFn ? filterVariationsFn(midVars) : midVars;
+                    base.variations = toArrayUniqueSorted(cleaned);
+                    base.variationCount = base.variations.length;
+                    upgradedTemplate = true;
+                }
+            }
+
+            // Merge variation lists if not fully recomputed via upgrade
+            const mergedVariations = upgradedTemplate
+                ? new Set(base.variations || [])
+                : new Set([...(base.variations || []), ...(other.variations || [])]);
+            const cleanedVars = filterVariationsFn ? filterVariationsFn(mergedVariations) : mergedVariations;
+            base.variations = toArrayUniqueSorted(cleanedVars);
+            base.variationCount = base.variations.length;
+            base.phraseSet = unionSets(base.phraseSet, other.phraseSet);
+            if (base.messageIds instanceof Set || other.messageIds instanceof Set) {
+                base.messageIds = unionSets(base.messageIds, other.messageIds);
+            }
+            base.occurrences = (base.occurrences || 0) + (other.occurrences || 0);
+            base.score = Math.max(Number(base.score || 0), Number(other.score || 0));
+            // Merge phraseTokenMap for future merges
+            if (!base.phraseTokenMap) base.phraseTokenMap = new Map();
+            if (other.phraseTokenMap && typeof other.phraseTokenMap.forEach === 'function') {
+                other.phraseTokenMap.forEach((val, key) => {
+                    if (!base.phraseTokenMap.has(key)) base.phraseTokenMap.set(key, val);
+                });
+            }
+
+            // If base was k and we merged p into it, we’re done; if base was p, replace kept[i]
+            if (pBetter) {
+                kept[i] = base;
+            }
+            merged = true;
+            break;
+        }
+        if (!merged) kept.push(p);
     }
 
-    // Second pass: Remove substrings if they have significantly lower scores
-    // This prevents the duplicate overlapping phrases issue
-    // OPTIMIZATION: Limit to top phrases to avoid O(n²) complexity on large sets
-    const maxPhrasesToCheck = Math.min(sortedPhrases.length, 500);
+    // Final pass: drop any patterns that now have < 2 variations
+    return kept.filter(p => (p.variations?.length || 0) >= 2);
+}
 
-    for (let i = 0; i < maxPhrasesToCheck; i++) {
-        const longerPhrase = sortedPhrases[i];
-        if (phrasesToRemove.has(longerPhrase)) continue;
+function cullSubstrings(frequenciesObject) {
+    // Token-level contiguous substring culling to prevent duplicates
+    const culled = { ...frequenciesObject };
+    const entries = Object.entries(culled).map(([phrase, score]) => ({
+        phrase,
+        score,
+        tokens: phrase.split(' ').filter(Boolean),
+    }));
 
-        const longerScore = culledFrequencies[longerPhrase];
+    // Sort by token length desc then by score desc
+    entries.sort((a, b) => (b.tokens.length - a.tokens.length) || (b.score - a.score));
+    const removed = new Set();
+    const maxCheck = Math.min(entries.length, 500);
 
-        // Only check phrases that could potentially be substrings
-        for (let j = i + 1; j < maxPhrasesToCheck; j++) {
-            const shorterPhrase = sortedPhrases[j];
-            if (phrasesToRemove.has(shorterPhrase)) continue;
+    function containsContiguous(longerTokens, shorterTokens) {
+        if (shorterTokens.length > longerTokens.length) return false;
+        for (let i = 0; i <= longerTokens.length - shorterTokens.length; i++) {
+            let ok = true;
+            for (let j = 0; j < shorterTokens.length; j++) {
+                if (longerTokens[i + j] !== shorterTokens[j]) { ok = false; break; }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
 
-            // Quick length check before expensive string operation
-            if (shorterPhrase.length >= longerPhrase.length) continue;
-
-            // Check if shorter phrase is contained in longer phrase
-            if (longerPhrase.includes(shorterPhrase)) {
-                const shorterScore = culledFrequencies[shorterPhrase];
-
-                // Remove the shorter phrase if:
-                // 1. The longer phrase has a higher or similar score (within 20%)
-                // 2. OR the phrases overlap significantly (more than 70% of shorter phrase)
-                const scoreDifference = Math.abs(longerScore - shorterScore) / Math.max(longerScore, shorterScore);
-                const overlapRatio = shorterPhrase.length / longerPhrase.length;
-
-                if (scoreDifference < 0.2 || overlapRatio > 0.7) {
-                    // Keep the one with higher score
-                    if (longerScore >= shorterScore) {
-                        phrasesToRemove.add(shorterPhrase);
+    for (let i = 0; i < maxCheck; i++) {
+        const L = entries[i];
+        if (!L || removed.has(L.phrase)) continue;
+        for (let j = i + 1; j < maxCheck; j++) {
+            const S = entries[j];
+            if (!S || removed.has(S.phrase)) continue;
+            if (S.tokens.length >= L.tokens.length) continue;
+            if (containsContiguous(L.tokens, S.tokens)) {
+                const scoreDiff = Math.abs(L.score - S.score) / Math.max(L.score, S.score);
+                const overlapRatio = S.tokens.length / L.tokens.length;
+                if (scoreDiff < 0.2 || overlapRatio > 0.7) {
+                    if (L.score >= S.score) {
+                        removed.add(S.phrase);
                     } else {
-                        phrasesToRemove.add(longerPhrase);
-                        break; // No need to check more shorter phrases for this longer one
+                        removed.add(L.phrase);
+                        break;
                     }
                 }
             }
         }
     }
 
-    phrasesToRemove.forEach(phrase => {
-        delete culledFrequencies[phrase];
-    });
-    return culledFrequencies;
+    removed.forEach(p => { delete culled[p]; });
+    return culled;
 }
 
 
@@ -485,6 +795,25 @@ export class Analyzer {
 
         this.effectiveWhitelist = new Set();
         this.updateEffectiveWhitelist();
+
+        // Frequency stats for significance weighting
+        this.unigramCounts = new Map();
+        this.bigramCounts = new Map();
+        this.totalUnigrams = 0;
+        this.totalBigrams = 0;
+
+        // Skip-modifier set (can be extended later)
+        this.skipModifierSet = new Set(DEFAULT_SKIP_MODIFIERS);
+
+        // Alias mapping for skip-gram normalized keys → canonical base key
+        this.aliasKeyToBaseKey = new Map();
+
+        // Running PMI calibration (for significance scaling)
+        this.pmiRunningMean = 0;
+        this.pmiCount = 0;
+
+        // Cached macro payload (as JSON string) for quick macro expansion
+        this.slopListCacheString = '[]';
     }
 
     updateEffectiveWhitelist() {
@@ -537,19 +866,21 @@ export class Analyzer {
     isPhraseLowQuality(wordStats) {
         if (!wordStats || typeof wordStats !== 'object') return true;
 
-        // Filter 1: Must be at least NGRAM_MIN words long.
-        if (wordStats.total < NGRAM_MIN) return true;
+        const enableBigrams = !!this.settings.enableBigrams;
+        const minN = enableBigrams ? 2 : NGRAM_MIN;
+        if (wordStats.total < minN) return true;
 
-        // Filter 2: Check if phrase contains any user-whitelisted words or character names
-        // These should cause phrases to be ignored entirely
-        if (wordStats.hasWhitelistedWord) return true;
+        // Do not discard phrases just because a whitelisted name appears; we mask names.
 
-        // Filter 3: Must contain at least one non-common word to be interesting
+        if (wordStats.total === 2) {
+            // Keep bigrams broadly; significance weighting will filter later
+            return false;
+        }
+
+        // For n >= 3, require at least one non-common word
         if (wordStats.allCommon) return true;
-
-        // Filter 4: Require at least two meaningful (non-common) words to avoid stopword-heavy phrases
+        // Require at least two meaningful (non-common) words
         if (wordStats.meaningfulCount < 2) return true;
-
         return false;
     }
 
@@ -589,7 +920,14 @@ export class Analyzer {
             ? Math.min((averageOccurrences - 1) / 3, 1)
             : 0;
 
-        let combinedSeverity = (messageSeverity * 0.6) + (repetitionSeverity * 0.25) + (lengthSeverity * 0.15);
+        // Significance term blended if enabled
+        let significance = 0;
+        if (this.settings.useSignificance && Array.isArray(entry.normalizedTokens)) {
+            significance = this.getSignificanceForTokens(entry.normalizedTokens);
+        }
+        const sigW = Math.max(0, Math.min(0.6, this.settings.significanceWeight || 0));
+
+        let combinedSeverity = (messageSeverity * 0.45) + (repetitionSeverity * 0.25) + (lengthSeverity * 0.10) + (significance * sigW);
         combinedSeverity *= wordQualityMultiplier;
         combinedSeverity *= chunkFactor;
 
@@ -625,6 +963,8 @@ export class Analyzer {
         const NGRAM_MAX = this.settings.ngramMax;
         const SLOP_THRESHOLD = this.settings.slopThreshold;
         const userWhitelistSet = new Set((this.settings.whitelist || []).map(w => w.toLowerCase()));
+        const enableBigrams = !!this.settings.enableBigrams;
+        const localMinN = enableBigrams ? 2 : NGRAM_MIN;
 
         // Debug log settings values occasionally
         if (this.totalAiMessagesProcessed % 50 === 0) {
@@ -638,7 +978,7 @@ export class Analyzer {
         }
 
         // CRITICAL CHANGE: Split text into sentences first to prevent cross-sentence n-grams.
-        const sentences = cleanText.match(/[^.!?]+[.!?]+["]?/g) || [cleanText];
+        const sentences = this.splitToSentences(cleanText);
 
         for (const sentence of sentences) {
             if (!sentence.trim()) continue;
@@ -646,18 +986,41 @@ export class Analyzer {
             const isDialogue = /["']/.test(sentence.trim().substring(0, 10));
             const chunkType = isDialogue ? 'dialogue' : 'narration';
 
-            const originalWords = sentence.replace(/[.,!?]/g, '').toLowerCase().split(/\s+/).filter(Boolean);
-            const lemmatizedWords = originalWords.map(word => lemmaMap.get(word) || word);
+            const originalWords = this.tokenize(sentence);
+            const normalizedTokens = this.maskAndNormalizeTokens(originalWords, userWhitelistSet);
+            this.updateCountsFromTokens(normalizedTokens);
 
-            for (let n = NGRAM_MIN; n <= NGRAM_MAX; n++) {
+            for (let n = localMinN; n <= NGRAM_MAX; n++) {
                 if (originalWords.length < n) continue;
 
                 const originalNgrams = generateNgrams(originalWords, n);
-                const lemmatizedNgrams = generateNgrams(lemmatizedWords, n);
+                const normalizedNgrams = [];
+                const normalizedTokenWindows = [];
+                for (let i = 0; i <= normalizedTokens.length - n; i++) {
+                    const window = normalizedTokens.slice(i, i + n);
+                    normalizedTokenWindows.push(window);
+                    let key = window.join(' ');
+                    if (this.settings.allowSkipGrams) {
+                        const idx = window.findIndex(t => this.skipModifierSet.has(t));
+                        if (idx !== -1) {
+                            const alt = window.slice(0, idx).concat(window.slice(idx + 1));
+                            if (alt.length >= Math.max(2, n - 1)) {
+                                const altKey = alt.join(' ');
+                                const existingBase = this.aliasKeyToBaseKey.get(altKey);
+                                const canonical = existingBase || key;
+                                this.aliasKeyToBaseKey.set(altKey, canonical);
+                                this.aliasKeyToBaseKey.set(key, canonical);
+                                key = canonical;
+                            }
+                        }
+                    }
+                    normalizedNgrams.push(key);
+                }
 
                 for (let i = 0; i < originalNgrams.length; i++) {
                     const originalNgram = originalNgrams[i];
-                    const lemmatizedNgram = lemmatizedNgrams[i];
+                    const normalizedKeyRaw = normalizedNgrams[i];
+                    const normalizedKey = this.aliasKeyToBaseKey.get(normalizedKeyRaw) || normalizedKeyRaw;
 
                     const wordStats = this.getWordStats(originalNgram, userWhitelistSet);
                     if (this.isPhraseLowQuality(wordStats)) {
@@ -665,7 +1028,7 @@ export class Analyzer {
                     }
 
                     const currentMessageIndex = this.totalAiMessagesProcessed;
-                    let entry = this.ngramFrequencies.get(lemmatizedNgram);
+                    let entry = this.ngramFrequencies.get(normalizedKey);
 
                     if (!entry) {
                         entry = {
@@ -678,11 +1041,13 @@ export class Analyzer {
                             contextSentence: sentence,
                             wordStats,
                             ngramLength: wordStats.total || n,
+                            normalizedTokens: normalizedTokenWindows[i],
                         };
-                        this.ngramFrequencies.set(lemmatizedNgram, entry);
+                        this.ngramFrequencies.set(normalizedKey, entry);
                     } else {
                         entry.wordStats = wordStats;
                         entry.ngramLength = wordStats.total || entry.ngramLength || n;
+                        entry.normalizedTokens = normalizedTokenWindows[i];
                     }
 
                     const isNewMessageOccurrence = !entry.messageIds.has(currentMessageIndex);
@@ -703,11 +1068,107 @@ export class Analyzer {
                     entry.score = this.calculateEntryScore(entry, wordStats, chunkType);
 
                     if (entry.score >= SLOP_THRESHOLD && previousScore < SLOP_THRESHOLD) {
-                        this.processNewSlopCandidate(lemmatizedNgram);
+                        this.processNewSlopCandidate(normalizedKey);
                     }
                 }
             }
         }
+    }
+
+    splitToSentences(text) {
+        const normalized = text
+            .replace(/[\u2014\u2015\u2013]/g, ' — ')
+            .replace(/\.\.\./g, ' … ')
+            .replace(/\n+/g, '\n');
+        const chunks = normalized.split(/\n/);
+        const sentences = [];
+        const re = /[^.!?;:…]+[.!?;:…]+["')\]]*|[^.!?;:…]+$/g;
+        for (const chunk of chunks) {
+            const matches = chunk.match(re);
+            if (matches) {
+                for (const m of matches) {
+                    const t = m.trim();
+                    if (t) sentences.push(t);
+                }
+            }
+        }
+        return sentences;
+    }
+
+    tokenize(sentence) {
+        const clean = sentence
+            .toLowerCase()
+            .replace(/[\u2014\u2015\u2013]/g, ' ')
+            .replace(/[^\p{L}\p{N}'#]+/gu, ' ')
+            .trim();
+        if (!clean) return [];
+        return clean.split(/\s+/).filter(Boolean);
+    }
+
+    simpleStem(token) {
+        if (!token || token.length < 3) return token;
+        if (lemmaMap.has(token)) return lemmaMap.get(token);
+        let t = token;
+        if (/ies$/.test(t) && t.length > 4) return t.slice(0, -3) + 'y';
+        if (/ing$/.test(t) && t.length > 4) return t.slice(0, -3);
+        if (/ed$/.test(t) && t.length > 3) return t.slice(0, -2);
+        if (/s$/.test(t) && t.length > 3) return t.slice(0, -1);
+        return t;
+    }
+
+    maskAndNormalizeTokens(tokens, userWhitelistSet) {
+        const out = [];
+        const maskNames = this.settings.maskNames !== false;
+        const stemCache = new Map();
+        for (const tok of tokens) {
+            if (!tok) continue;
+            if (/^\d+[\d,\.]*$/.test(tok)) { out.push('#NUM#'); continue; }
+            const isName = defaultNames.has(tok) || userWhitelistSet.has(tok);
+            if (maskNames && isName) { out.push('NAME'); continue; }
+            let norm = stemCache.get(tok);
+            if (!norm) { norm = this.simpleStem(tok); stemCache.set(tok, norm); }
+            out.push(norm);
+        }
+        return out;
+    }
+
+    updateCountsFromTokens(tokens) {
+        for (const t of tokens) {
+            const c = this.unigramCounts.get(t) || 0;
+            this.unigramCounts.set(t, c + 1);
+            this.totalUnigrams++;
+        }
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const k = tokens[i] + ' ' + tokens[i + 1];
+            const c = this.bigramCounts.get(k) || 0;
+            this.bigramCounts.set(k, c + 1);
+            this.totalBigrams++;
+        }
+    }
+
+    getSignificanceForTokens(tokens) {
+        if (!tokens || tokens.length < 2 || this.totalUnigrams === 0 || this.totalBigrams === 0) return 0;
+        const pmis = [];
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const a = tokens[i];
+            const b = tokens[i + 1];
+            const cA = (this.unigramCounts.get(a) || 0) + 1;
+            const cB = (this.unigramCounts.get(b) || 0) + 1;
+            const cAB = (this.bigramCounts.get(a + ' ' + b) || 0) + 1;
+            const pA = cA / (this.totalUnigrams + 1);
+            const pB = cB / (this.totalUnigrams + 1);
+            const pAB = cAB / (this.totalBigrams + 1);
+            const pmi = Math.log2(pAB / (pA * pB));
+            pmis.push(Math.max(0, pmi));
+        }
+        if (pmis.length === 0) return 0;
+        const avg = pmis.reduce((a, b) => a + b, 0) / pmis.length;
+        // Update running mean for calibration
+        this.pmiCount += 1;
+        this.pmiRunningMean += (avg - this.pmiRunningMean) / this.pmiCount;
+        const z = (avg - this.pmiRunningMean) / 2; // temperature controls spread
+        const sigmoid = 1 / (1 + Math.exp(-z));
+        return Math.max(0, Math.min(1, sigmoid));
     }
 
     processNewSlopCandidate(newPhraseLemmatized) {
@@ -768,6 +1229,18 @@ export class Analyzer {
             return new Set(variations);
         }
 
+        // Helper to normalize a variation string into comparable tokens
+        const normalizeWords = (text) => {
+            const words = text.toLowerCase().split(' ').filter(Boolean);
+            const cleaned = [];
+            for (const w of words) {
+                if (this.settings.allowSkipGrams && DEFAULT_SKIP_MODIFIERS.has(w)) continue;
+                const stem = this.simpleStem(w);
+                cleaned.push(stem);
+            }
+            return cleaned;
+        };
+
         // Sort by word-length descending to prioritize more specific suffixes first
         variations.sort((a, b) => {
             const aWords = a.split(' ').filter(Boolean).length;
@@ -780,7 +1253,7 @@ export class Analyzer {
         const keptWordLists = [];
 
         for (const variation of variations) {
-            const words = variation.split(' ').filter(Boolean);
+            const words = normalizeWords(variation);
             let isCovered = false;
 
             for (const existingWords of keptWordLists) {
@@ -809,6 +1282,102 @@ export class Analyzer {
         }
 
         return new Set(keptVariations);
+    }
+
+    buildMiddleSlotPatterns(phraseStatsMap, minCommonWords) {
+        const candidates = [];
+        const groupMap = new Map();
+
+        // Group phrases by left anchor of length = minCommonWords
+        for (const [phrase, stats] of Object.entries(phraseStatsMap)) {
+            const tokens = phrase.split(' ').filter(Boolean);
+            if (tokens.length <= minCommonWords + 1) continue; // need at least one middle token
+            const prefixTokens = tokens.slice(0, minCommonWords);
+            const key = prefixTokens.join(' ');
+            if (!groupMap.has(key)) groupMap.set(key, []);
+            groupMap.get(key).push({ phrase, tokens, stats });
+        }
+
+        for (const [prefix, list] of groupMap.entries()) {
+            if (!list || list.length < 2) continue;
+            const suffixCount = new Map();
+            const suffixTokensMap = new Map();
+
+            for (const ref of list) {
+                const tks = ref.tokens;
+                for (let sLen = 1; sLen <= minCommonWords; sLen++) {
+                    if (tks.length - minCommonWords - sLen < 1) continue; // ensure middle exists
+                    const suffixTokens = tks.slice(tks.length - sLen);
+                    const sKey = suffixTokens.join(' ');
+                    suffixCount.set(sKey, (suffixCount.get(sKey) || 0) + 1);
+                    suffixTokensMap.set(sKey, suffixTokens);
+                }
+            }
+
+            // Pick suffixes that appear at least twice
+            const suffixes = Array.from(suffixCount.entries()).filter(([k, c]) => c >= 2);
+            // Limit exploration
+            suffixes.sort((a, b) => b[1] - a[1]);
+            const topSuffixes = suffixes.slice(0, 3);
+
+            for (const [suffixKey, count] of topSuffixes) {
+                const suffixTokens = suffixTokensMap.get(suffixKey) || [];
+                const variations = new Set();
+                const phraseSet = new Set();
+                const phraseTokenMap = new Map();
+                const messageIds = new Set();
+                let totalOccurrences = 0;
+                let scoreSum = 0;
+                let scoreCount = 0;
+                let maxScore = 0;
+
+                for (const ref of list) {
+                    const tks = ref.tokens;
+                    const hasSuffix = suffixKey === tks.slice(tks.length - suffixTokens.length).join(' ');
+                    if (!hasSuffix) continue;
+                    const middle = tks.slice(minCommonWords, tks.length - suffixTokens.length).join(' ').trim();
+                    if (!middle) continue;
+                    variations.add(middle);
+                    phraseSet.add(ref.phrase);
+                    phraseTokenMap.set(ref.phrase, ref.tokens);
+
+                    const scoreValue = Number(ref.stats?.score ?? 0);
+                    if (Number.isFinite(scoreValue)) {
+                        scoreSum += scoreValue;
+                        scoreCount++;
+                        maxScore = Math.max(maxScore, scoreValue);
+                    }
+                    totalOccurrences += ref.stats?.occurrences ?? 0;
+                    const ids = ref.stats?.messageIds;
+                    if (ids && typeof ids.forEach === 'function') ids.forEach(id => messageIds.add(id));
+                }
+
+                const cleanedVariations = this.filterRedundantVariations(variations);
+                if (cleanedVariations.size < 2) continue;
+
+                const sortedVariations = Array.from(cleanedVariations).sort((a, b) => a.localeCompare(b));
+                const averageScore = scoreCount > 0 ? scoreSum / scoreCount : 0;
+                const diversityBonus = variations.size > 1 ? Math.min(2, Math.log1p(variations.size - 1) * 0.75) : 0;
+                const candidateScore = Math.min(10, Math.max(maxScore, averageScore + diversityBonus));
+
+                candidates.push({
+                    prefix,
+                    prefixTokens: prefix.split(' '),
+                    suffix: suffixKey,
+                    suffixTokens,
+                    variations: sortedVariations,
+                    score: candidateScore,
+                    occurrences: totalOccurrences,
+                    messageIds,
+                    variationCount: sortedVariations.length,
+                    phraseSet,
+                    depth: minCommonWords,
+                    phraseTokenMap,
+                });
+            }
+        }
+
+        return candidates;
     }
 
     findAndMergePatterns(frequenciesObjectWithOriginals) {
@@ -863,42 +1432,82 @@ export class Analyzer {
             }
         }
 
-        const trieRoot = buildPhraseTrie(culledStats);
-        const patternCandidates = collectPatternCandidatesFromTrie(
-            trieRoot,
-            PATTERN_MIN_COMMON_WORDS,
-            variations => this.filterRedundantVariations(variations),
-        );
-        const dedupedCandidates = deduplicatePatternCandidates(patternCandidates);
-        const filteredCandidates = filterContainedPatternCandidates(dedupedCandidates, {
-            overlapThreshold: 0.6,
-            maxShift: 3,
-        });
+        const patternsEnabled = this.settings.patternTypes || { prefix: true, suffix: true, middle: true };
+        const allCandidates = [];
 
-        const mergedPatterns = {};
-        const consumedPhrases = new Set();
+        if (patternsEnabled.prefix) {
+            const trieRoot = buildPhraseTrie(culledStats);
+            const prefixCandidates = collectPatternCandidatesFromTrie(
+                trieRoot,
+                PATTERN_MIN_COMMON_WORDS,
+                variations => this.filterRedundantVariations(variations),
+            );
+            allCandidates.push(...prefixCandidates.map(c => ({ ...c, kind: 'prefix' })));
+        }
 
+        if (patternsEnabled.suffix) {
+            const suffixRoot = buildSuffixTrie(culledStats);
+            const suffixCandidates = collectSuffixPatternCandidatesFromTrie(
+                suffixRoot,
+                PATTERN_MIN_COMMON_WORDS,
+                variations => this.filterRedundantVariations(variations),
+            );
+            allCandidates.push(...suffixCandidates.map(c => ({ ...c, kind: 'suffix' })));
+        }
+
+        if (patternsEnabled.middle) {
+            const middleCandidates = this.buildMiddleSlotPatterns(culledStats, PATTERN_MIN_COMMON_WORDS);
+            allCandidates.push(...middleCandidates.map(c => ({ ...c, kind: 'middle' })));
+        }
+
+        const dedupedCandidates = deduplicatePatternCandidates(allCandidates);
+        // Cross-kind containment filtering to reduce messy duplicates
+        const filteredCandidates = filterContainedPatternCandidatesGeneric(dedupedCandidates, { overlapThreshold: 0.6 });
+
+        // Convert to pattern objects
+        const patternObjects = [];
         for (const candidate of filteredCandidates) {
-            if (!candidate.prefix || candidate.variations.length < 2) continue;
+            if ((!candidate.prefix && !candidate.suffix) || !candidate.variations || candidate.variations.length < 2) continue;
+            let template;
+            if (candidate.kind === 'prefix') {
+                template = `${candidate.prefix} {variant}`;
+            } else if (candidate.kind === 'suffix' && candidate.suffix) {
+                template = `{variant} ${candidate.suffix}`;
+            } else if (candidate.kind === 'middle' && candidate.suffix) {
+                template = `${candidate.prefix} {variant} ${candidate.suffix}`;
+            } else {
+                template = `${candidate.prefix} {variant}`;
+            }
 
-            const patternKey = `${candidate.prefix}|${candidate.variations.join('/')}`;
-            const messageCap = this.totalAiMessagesProcessed > 0
-                ? this.totalAiMessagesProcessed
-                : candidate.messageIds.size;
+            const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : candidate.messageIds.size;
             const cappedMessageIds = new Set();
             for (const id of candidate.messageIds) {
                 if (cappedMessageIds.size >= messageCap) break;
                 cappedMessageIds.add(id);
             }
 
-            mergedPatterns[patternKey] = {
+            patternObjects.push({
+                template,
+                kind: candidate.kind,
+                prefixTokens: candidate.prefixTokens || [],
+                suffixTokens: candidate.suffixTokens || [],
+                variations: [...candidate.variations],
+                variationCount: candidate.variationCount,
                 score: candidate.score,
                 occurrences: candidate.occurrences,
                 messageIds: cappedMessageIds,
-                variationCount: Math.max(1, candidate.variationCount),
-            };
+                phraseSet: new Set(candidate.phraseSet || []),
+                phraseTokenMap: candidate.phraseTokenMap || new Map(),
+            });
+        }
 
-            candidate.phraseSet.forEach(phrase => consumedPhrases.add(phrase));
+        // Merge similar/overlapping pattern objects with preference for specificity
+        const mergedObjs = mergePatternObjects(patternObjects, (vars) => this.filterRedundantVariations(vars));
+
+        // Track consumed phrases to exclude from standalone list
+        const consumedPhrases = new Set();
+        for (const obj of mergedObjs) {
+            (obj.phraseSet || []).forEach(p => consumedPhrases.add(p));
         }
 
         // For remaining phrases, apply very strict filtering
@@ -927,23 +1536,18 @@ export class Analyzer {
         }
 
         const normalizedMerged = {};
-        for (const [pattern, data] of Object.entries(mergedPatterns)) {
-            const messageCount = data?.messageIds && typeof data.messageIds.size === 'number'
-                ? data.messageIds.size
-                : (data?.messageCount ?? 0);
-            if (!Number.isFinite(messageCount) || messageCount <= 1) {
-                continue;
-            }
-            const variationCount = Math.max(1, data?.variationCount ?? 1);
-            const rawScore = Number(data?.score ?? 0);
-            const normalizedScore = Number.isFinite(rawScore)
-                ? Math.min(10, rawScore)
-                : 0;
-            normalizedMerged[pattern] = {
+        for (const obj of mergedObjs) {
+            const messageCount = obj?.messageIds && typeof obj.messageIds.size === 'number' ? obj.messageIds.size : 0;
+            if (!Number.isFinite(messageCount) || messageCount <= 1) continue;
+            const rawScore = Number(obj?.score ?? 0);
+            const normalizedScore = Number.isFinite(rawScore) ? Math.min(10, rawScore) : 0;
+            const variationsSorted = [...(obj.variations || [])].sort((a, b) => a.localeCompare(b));
+            const patternKey = `${obj.template}|${variationsSorted.join('/')}`;
+            normalizedMerged[patternKey] = {
                 score: Number.isFinite(normalizedScore) ? normalizedScore : 0,
                 messageCount,
-                occurrences: data?.occurrences ?? 0,
-                variationCount,
+                occurrences: obj?.occurrences ?? 0,
+                variationCount: Math.max(1, obj?.variationCount ?? variationsSorted.length),
             };
         }
 
@@ -1009,6 +1613,11 @@ export class Analyzer {
             merged: Object.fromEntries(mergedEntries),
             remaining: Object.fromEntries(allRemainingEntries),
         };
+
+        // Refresh macro cache after each analysis
+        if (typeof this.refreshSlopListCache === 'function') {
+            this.refreshSlopListCache();
+        }
     }
 
     showFrequencyLeaderboard() {
@@ -1218,6 +1827,14 @@ export class Analyzer {
         this.analyzedLeaderboardData = { merged: {}, remaining: {} };
         this.lastAnalysisMessageCount = 0; // Reset analysis tracking
         this.totalAiMessagesProcessed = 0; // Reset message counter
+        // Reset significance counts
+        if (this.unigramCounts) this.unigramCounts.clear();
+        if (this.bigramCounts) this.bigramCounts.clear();
+        this.totalUnigrams = 0;
+        this.totalBigrams = 0;
+        if (this.aliasKeyToBaseKey) this.aliasKeyToBaseKey.clear();
+        this.pmiRunningMean = 0;
+        this.pmiCount = 0;
         this.toastr.success("Prose Polisher frequency data cleared!");
     }
 
@@ -1259,8 +1876,9 @@ export class Analyzer {
                     if (template && variationString) {
                         const variants = variationString.split('/').map(v => v.trim()).filter(v => v);
                         
+                        const templ = template.includes('{variant}') ? template.trim() : `${template.trim()} {variant}`;
                         slopList.push({
-                            pattern_template: `${template.trim()} {variant}`,
+                            pattern_template: templ,
                             variants: variants,
                             score: roundedScore,
                             type: 'pattern'
@@ -1302,6 +1920,17 @@ export class Analyzer {
         
         console.log(`${LOG_PREFIX} getSlopList() returning ${slopList.length} items above threshold ${SLOP_THRESHOLD}`);
         return slopList;
+    }
+
+    // Cached slop list JSON string, refreshed after analyses to ensure macro returns a stable snapshot
+    refreshSlopListCache() {
+        try {
+            const list = this.getSlopList();
+            this.slopListCacheString = JSON.stringify(list);
+        } catch (e) {
+            console.error(`${LOG_PREFIX} Error refreshing slopList cache:`, e);
+            this.slopListCacheString = '[]';
+        }
     }
 
     async manualAnalyzeChatHistory() {
@@ -1348,6 +1977,13 @@ export class Analyzer {
             this.ngramFrequencies.clear();
             this.slopCandidates.clear();
             this.totalAiMessagesProcessed = 0;
+            if (this.unigramCounts) this.unigramCounts.clear();
+            if (this.bigramCounts) this.bigramCounts.clear();
+            this.totalUnigrams = 0;
+            this.totalBigrams = 0;
+            if (this.aliasKeyToBaseKey) this.aliasKeyToBaseKey.clear();
+            this.pmiRunningMean = 0;
+            this.pmiCount = 0;
 
             // Log current settings being used for analysis
             console.log(`${LOG_PREFIX} Manual analysis using settings:`, {
