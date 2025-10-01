@@ -51,6 +51,345 @@ function generateNgrams(words, n) {
     return ngrams;
 }
 
+class PhraseTrieNode {
+    constructor(word = '', depth = 0, tokens = []) {
+        this.word = word;
+        this.depth = depth;
+        this.tokens = tokens;
+        this.children = new Map();
+        this.phraseRefs = [];
+        this.isTerminal = false;
+    }
+}
+
+const HYPHEN_SPLIT_REGEX = /[\-–—]+/g;
+
+function normalizeTokenForComparison(token) {
+    if (!token) return '';
+    const trimmed = token.replace(/^[^A-Za-z0-9']+|[^A-Za-z0-9']+$/g, '');
+    return trimmed.toLowerCase();
+}
+
+function normalizeTokensSegment(tokens, startIndex = 0) {
+    const normalized = [];
+    for (let i = startIndex; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (!token) continue;
+        const parts = token.split(HYPHEN_SPLIT_REGEX);
+        for (const part of parts) {
+            const normalizedPart = normalizeTokenForComparison(part);
+            if (normalizedPart) {
+                normalized.push(normalizedPart);
+            }
+        }
+    }
+    return normalized.join(' ');
+}
+
+function buildPhraseTrie(phraseStatsMap) {
+    const root = new PhraseTrieNode('', 0, []);
+    for (const [phrase, stats] of Object.entries(phraseStatsMap)) {
+        if (!phrase || !stats) continue;
+        const tokens = phrase.split(' ').filter(Boolean);
+        if (tokens.length === 0) continue;
+
+        const phraseRef = {
+            phrase,
+            tokens,
+            stats,
+        };
+
+        let node = root;
+        for (const token of tokens) {
+            if (!node.children.has(token)) {
+                const childTokens = node.tokens.length ? [...node.tokens, token] : [token];
+                node.children.set(token, new PhraseTrieNode(token, node.depth + 1, childTokens));
+            }
+            node = node.children.get(token);
+            node.phraseRefs.push(phraseRef);
+        }
+        node.isTerminal = true;
+    }
+    return root;
+}
+
+function collectPatternCandidatesFromTrie(root, minCommonWords, filterVariations) {
+    const candidates = [];
+    const stack = [...root.children.values()];
+
+    while (stack.length > 0) {
+        const node = stack.pop();
+        node.children.forEach(child => stack.push(child));
+
+        if (node.depth < minCommonWords) continue;
+        if (!node.phraseRefs || node.phraseRefs.length < 2) continue;
+
+        const rawVariations = new Set();
+        const phraseSet = new Set();
+        const phraseTokenMap = new Map();
+        const messageIds = new Set();
+        let totalOccurrences = 0;
+        let scoreSum = 0;
+        let scoreCount = 0;
+        let maxScore = 0;
+
+        const uniquePhraseRefs = new Map();
+        for (const ref of node.phraseRefs) {
+            if (!ref || !ref.tokens || !ref.phrase) continue;
+            if (!uniquePhraseRefs.has(ref.phrase)) {
+                uniquePhraseRefs.set(ref.phrase, ref);
+            }
+        }
+
+        const seenStats = new Set();
+
+        for (const ref of uniquePhraseRefs.values()) {
+            const suffixTokens = ref.tokens.slice(node.depth);
+            if (suffixTokens.length === 0) continue;
+            const variation = suffixTokens.join(' ').trim();
+            if (!variation) continue;
+
+            rawVariations.add(variation);
+            phraseSet.add(ref.phrase);
+            phraseTokenMap.set(ref.phrase, ref.tokens);
+
+            if (!seenStats.has(ref.stats)) {
+                seenStats.add(ref.stats);
+                const scoreValue = Number(ref.stats?.score ?? 0);
+                if (Number.isFinite(scoreValue)) {
+                    scoreSum += scoreValue;
+                    scoreCount++;
+                    maxScore = Math.max(maxScore, scoreValue);
+                }
+                totalOccurrences += ref.stats?.occurrences ?? 0;
+            }
+
+            const ids = ref.stats?.messageIds;
+            if (ids && typeof ids.forEach === 'function') {
+                ids.forEach(id => messageIds.add(id));
+            } else if (Number.isFinite(ref.stats?.lastSeenMessageIndex)) {
+                messageIds.add(ref.stats.lastSeenMessageIndex);
+            }
+        }
+
+        if (rawVariations.size < 2 || phraseSet.size < 2) {
+            continue;
+        }
+
+        const cleanedVariations = filterVariations(rawVariations);
+        if (!cleanedVariations || cleanedVariations.size < 2) {
+            continue;
+        }
+
+        const sortedVariations = Array.from(cleanedVariations).sort((a, b) => a.localeCompare(b));
+
+        const averageScore = scoreCount > 0 ? scoreSum / scoreCount : 0;
+        const diversityBonus = rawVariations.size > 1
+            ? Math.min(2, Math.log1p(rawVariations.size - 1) * 0.75)
+            : 0;
+        const candidateScore = Math.min(10, Math.max(maxScore, averageScore + diversityBonus));
+
+        candidates.push({
+            prefix: node.tokens.join(' '),
+            prefixTokens: [...node.tokens],
+            variations: sortedVariations,
+            score: candidateScore,
+            occurrences: totalOccurrences,
+            messageIds,
+            variationCount: sortedVariations.length,
+            phraseSet,
+            depth: node.depth,
+            phraseTokenMap,
+        });
+    }
+
+    return candidates;
+}
+
+function countSetIntersection(a, b) {
+    let count = 0;
+    for (const value of a) {
+        if (b.has(value)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+function deduplicatePatternCandidates(candidates, overlapThreshold = 0.9) {
+    const sortedCandidates = [...candidates].sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.variationCount !== a.variationCount) return b.variationCount - a.variationCount;
+        return b.depth - a.depth;
+    });
+
+    const accepted = [];
+
+    for (const candidate of sortedCandidates) {
+        let isCovered = false;
+        for (const kept of accepted) {
+            const minSize = Math.min(candidate.phraseSet.size, kept.phraseSet.size);
+            if (minSize === 0) continue;
+            const overlap = countSetIntersection(candidate.phraseSet, kept.phraseSet);
+            if (overlap / minSize >= overlapThreshold) {
+                isCovered = true;
+                break;
+            }
+        }
+
+        if (!isCovered) {
+            accepted.push(candidate);
+        }
+    }
+
+    return accepted;
+}
+
+const SHIFTED_PHRASE_CACHE = new WeakMap();
+
+function getShiftedPhraseSets(candidate, maxShift = 3) {
+    if (SHIFTED_PHRASE_CACHE.has(candidate)) {
+        return SHIFTED_PHRASE_CACHE.get(candidate);
+    }
+
+    const prefixLength = candidate.prefixTokens ? candidate.prefixTokens.length : candidate.prefix.split(' ').filter(Boolean).length;
+    const limit = Math.min(maxShift, prefixLength);
+    const shifted = new Map();
+
+    for (const tokens of candidate.phraseTokenMap?.values() || []) {
+        if (!Array.isArray(tokens) || tokens.length === 0) continue;
+        const maxLocalShift = Math.min(limit, tokens.length - 1);
+        for (let shift = 0; shift <= maxLocalShift; shift++) {
+            const normalizedSegment = normalizeTokensSegment(tokens, shift);
+            if (!normalizedSegment) continue;
+            if (!shifted.has(shift)) {
+                shifted.set(shift, new Set());
+            }
+            shifted.get(shift).add(normalizedSegment);
+        }
+    }
+
+    SHIFTED_PHRASE_CACHE.set(candidate, shifted);
+    return shifted;
+}
+
+function evaluatePatternOverlap(candidateA, candidateB, options = {}) {
+    const { overlapThreshold = 0.6, maxShift = 3 } = options;
+    const shiftedA = getShiftedPhraseSets(candidateA, maxShift);
+    const shiftedB = getShiftedPhraseSets(candidateB, maxShift);
+
+    let best = null;
+
+    for (const [shiftA, setA] of shiftedA.entries()) {
+        if (!setA || setA.size === 0) continue;
+        for (const [shiftB, setB] of shiftedB.entries()) {
+            if (!setB || setB.size === 0) continue;
+
+            let overlapCount = 0;
+            for (const phrase of setA) {
+                if (setB.has(phrase)) {
+                    overlapCount++;
+                }
+            }
+            if (overlapCount === 0) continue;
+
+            const minSize = Math.min(setA.size, setB.size);
+            if (minSize === 0) continue;
+
+            const ratio = overlapCount / minSize;
+
+            if (ratio < overlapThreshold) {
+                continue;
+            }
+
+            if (!best || ratio > best.ratio || (ratio === best.ratio && overlapCount > best.count)) {
+                best = {
+                    ratio,
+                    count: overlapCount,
+                    shiftA,
+                    shiftB,
+                    setASize: setA.size,
+                    setBSize: setB.size,
+                };
+            }
+        }
+    }
+
+    return best;
+}
+
+function preferFirstPattern(first, second, overlapInfo) {
+    const shiftA = overlapInfo?.shiftA ?? 0;
+    const shiftB = overlapInfo?.shiftB ?? 0;
+
+    if (shiftA !== shiftB) {
+        return shiftA > shiftB;
+    }
+
+    const prefixLenFirst = first.prefixTokens ? first.prefixTokens.length : first.prefix.split(' ').filter(Boolean).length;
+    const prefixLenSecond = second.prefixTokens ? second.prefixTokens.length : second.prefix.split(' ').filter(Boolean).length;
+
+    if (prefixLenFirst !== prefixLenSecond) {
+        return prefixLenFirst > prefixLenSecond;
+    }
+
+    const scoreFirst = Number(first.score ?? 0);
+    const scoreSecond = Number(second.score ?? 0);
+    if (scoreFirst !== scoreSecond) {
+        return scoreFirst > scoreSecond;
+    }
+
+    const variationFirst = Number(first.variationCount ?? 0);
+    const variationSecond = Number(second.variationCount ?? 0);
+    if (variationFirst !== variationSecond) {
+        return variationFirst > variationSecond;
+    }
+
+    return true;
+}
+
+function filterContainedPatternCandidates(candidates, options = {}) {
+    const { overlapThreshold = 0.6, maxShift = 3 } = options;
+    const filtered = [];
+
+    const sorted = [...candidates].sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.variationCount !== a.variationCount) return b.variationCount - a.variationCount;
+        const aPrefixLen = a.prefixTokens ? a.prefixTokens.length : a.prefix.split(' ').filter(Boolean).length;
+        const bPrefixLen = b.prefixTokens ? b.prefixTokens.length : b.prefix.split(' ').filter(Boolean).length;
+        return bPrefixLen - aPrefixLen;
+    });
+
+    for (const candidate of sorted) {
+        let isDominated = false;
+
+        for (let i = 0; i < filtered.length; i++) {
+            const kept = filtered[i];
+            const overlapInfo = evaluatePatternOverlap(candidate, kept, { overlapThreshold, maxShift });
+            if (!overlapInfo) continue;
+
+            const preferKept = preferFirstPattern(kept, candidate, {
+                shiftA: overlapInfo.shiftB,
+                shiftB: overlapInfo.shiftA,
+            });
+
+            if (preferKept) {
+                isDominated = true;
+                break;
+            }
+
+            filtered.splice(i, 1);
+            i--;
+        }
+
+        if (!isDominated) {
+            filtered.push(candidate);
+        }
+    }
+
+    return filtered;
+}
+
 function cullSubstrings(frequenciesObject) {
     // This function removes overlapping/substring phrases to prevent duplicates
     // while keeping the highest scoring versions
@@ -242,22 +581,27 @@ export class Analyzer {
         wordQualityMultiplier = Math.max(0.45, Math.min(1.2, wordQualityMultiplier));
 
         const ngramLength = entry.ngramLength || totalWords || NGRAM_MIN;
-        const lengthFactor = 1 + Math.min(Math.max(ngramLength - NGRAM_MIN, 0), 6) * 0.08;
-        const chunkFactor = chunkType === 'narration' ? 1.08 : 1;
+        const lengthSeverity = Math.min(Math.max(ngramLength - (NGRAM_MIN - 1), 0) / 6, 1);
+        const chunkFactor = chunkType === 'narration' ? 1.05 : 1;
 
-        const baseStrength = Math.pow(distinctMessages, 1.2) * 1.5;
-        const baseScore = baseStrength * wordQualityMultiplier * lengthFactor * chunkFactor;
+        const messageSeverity = Math.min(distinctMessages / 6, 1);
+        const repetitionSeverity = averageOccurrences > 1
+            ? Math.min((averageOccurrences - 1) / 3, 1)
+            : 0;
 
-        let repetitionBoost = 0;
-        if (averageOccurrences > 1) {
-            repetitionBoost = Math.min(4, Math.log2(Math.max(averageOccurrences, 1.0001)) * 2.5);
+        let combinedSeverity = (messageSeverity * 0.6) + (repetitionSeverity * 0.25) + (lengthSeverity * 0.15);
+        combinedSeverity *= wordQualityMultiplier;
+        combinedSeverity *= chunkFactor;
+
+        const blacklistWeight = this.getBlacklistWeight(entry.original || '');
+        const blacklistSeverity = Math.min(3, Math.max(0, blacklistWeight * 0.5));
+
+        let finalScore = (combinedSeverity * 10) + blacklistSeverity;
+        if (!Number.isFinite(finalScore)) {
+            finalScore = 0;
         }
 
-        const blacklistBonus = this.getBlacklistWeight(entry.original || '') * 0.6;
-
-        const finalScore = Math.max(0, baseScore + repetitionBoost + blacklistBonus);
-
-        return Number.isFinite(finalScore) ? finalScore : 0;
+        return Math.max(0, Math.min(10, finalScore));
     }
 
     getBlacklistWeight(phrase) {
@@ -467,102 +811,6 @@ export class Analyzer {
         return new Set(keptVariations);
     }
 
-    mergeRelatedPatterns(patterns) {
-        // Convert patterns to an array for processing
-        const patternArray = Object.entries(patterns).map(([pattern, data]) => {
-            const [prefix, variationsStr] = pattern.split('|');
-            return {
-                prefix: prefix.trim(),
-                variations: variationsStr ? variationsStr.split('/').map(v => v.trim()) : [],
-                score: data?.score ?? 0,
-                messageIds: new Set(data?.messageIds || []),
-                occurrences: data?.occurrences ?? 0,
-                variationCount: Math.max(1, data?.variationCount ?? ((variationsStr ? variationsStr.split('/').length : 0) || 1)),
-                fullPattern: pattern
-            };
-        });
-
-        // Sort by prefix length (shortest first) to merge upward
-        patternArray.sort((a, b) => a.prefix.split(' ').length - b.prefix.split(' ').length);
-
-        const mergedResults = {};
-        const consumedPatterns = new Set();
-
-        for (let i = 0; i < patternArray.length; i++) {
-            if (consumedPatterns.has(i)) continue;
-
-            const basePattern = patternArray[i];
-            let combinedVariations = new Set(basePattern.variations);
-            let totalScore = basePattern.score;
-            let totalOccurrences = basePattern.occurrences;
-            const combinedMessageIds = new Set(basePattern.messageIds);
-            let shortestPrefix = basePattern.prefix;
-            let totalVariationCount = basePattern.variationCount || Math.max(1, basePattern.variations.length);
-
-            // Find all patterns that contain this prefix
-            for (let j = 0; j < patternArray.length; j++) {
-                if (i === j || consumedPatterns.has(j)) continue;
-
-                const otherPattern = patternArray[j];
-
-                // Check if one prefix ends with the other (they're related)
-                if (otherPattern.prefix.endsWith(basePattern.prefix) ||
-                    basePattern.prefix.endsWith(otherPattern.prefix)) {
-
-                    // Use the shorter prefix as the base
-                    if (otherPattern.prefix.length < shortestPrefix.length) {
-                        shortestPrefix = otherPattern.prefix;
-                    }
-
-                    // Combine all variations
-                    otherPattern.variations.forEach(v => combinedVariations.add(v));
-                    totalScore += otherPattern.score;
-                    totalOccurrences += otherPattern.occurrences;
-                    if (otherPattern.messageIds && typeof otherPattern.messageIds.forEach === 'function') {
-                        otherPattern.messageIds.forEach(id => combinedMessageIds.add(id));
-                    }
-                    totalVariationCount += otherPattern.variationCount || Math.max(1, otherPattern.variations.length);
-                    consumedPatterns.add(j);
-                }
-            }
-
-            const dedupedVariations = this.filterRedundantVariations(combinedVariations);
-
-            // Only create a merged pattern if we still have variations after deduplication
-            if (dedupedVariations.size > 0) {
-                const mergedPattern = `${shortestPrefix}|${Array.from(dedupedVariations).join('/')}`;
-                const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : combinedMessageIds.size;
-                const cappedMessageIds = new Set();
-                for (const id of combinedMessageIds) {
-                    if (cappedMessageIds.size >= messageCap) break;
-                    cappedMessageIds.add(id);
-                }
-                mergedResults[mergedPattern] = {
-                    score: totalScore,
-                    messageIds: cappedMessageIds,
-                    occurrences: totalOccurrences,
-                    variationCount: Math.max(1, totalVariationCount),
-                };
-            } else {
-                // Keep the original pattern
-                const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : combinedMessageIds.size;
-                const cappedMessageIds = new Set();
-                for (const id of combinedMessageIds) {
-                    if (cappedMessageIds.size >= messageCap) break;
-                    cappedMessageIds.add(id);
-                }
-                mergedResults[basePattern.fullPattern] = {
-                    score: basePattern.score,
-                    messageIds: cappedMessageIds,
-                    occurrences: basePattern.occurrences,
-                    variationCount: Math.max(1, basePattern.variationCount || basePattern.variations.length || 1),
-                };
-            }
-        }
-
-        return mergedResults;
-    }
-
     findAndMergePatterns(frequenciesObjectWithOriginals) {
         // OPTIMIZATION: Early exit if no data
         if (!frequenciesObjectWithOriginals || Object.keys(frequenciesObjectWithOriginals).length === 0) {
@@ -584,7 +832,10 @@ export class Analyzer {
                 };
             }
 
-            phraseStatsMap[originalPhrase].score += data.score || 0;
+            phraseStatsMap[originalPhrase].score = Math.max(
+                phraseStatsMap[originalPhrase].score || 0,
+                Number.isFinite(data.score) ? data.score : 0,
+            );
             phraseStatsMap[originalPhrase].occurrences += data.count || 0;
 
             if (data.messageIds && typeof data.messageIds.forEach === 'function') {
@@ -612,126 +863,43 @@ export class Analyzer {
             }
         }
 
-        const candidateEntries = Object.entries(culledStats).sort((a, b) => a[0].localeCompare(b[0]));
-        const candidates = candidateEntries.map(([phrase, stats], idx) => ({
-            index: idx,
-            phrase,
-            score: stats.score,
-            messageIds: new Set(stats.messageIds || []),
-            occurrences: stats.occurrences,
-        }));
-
-        const mergedPatterns = {};
-        const consumedIndices = new Set();
-
-        // Group phrases by length first - only merge phrases of the same length
-        const phrasesByLength = {};
-        candidates.forEach(candidate => {
-            const length = candidate.phrase.split(' ').length;
-            if (!phrasesByLength[length]) {
-                phrasesByLength[length] = [];
-            }
-            phrasesByLength[length].push(candidate);
+        const trieRoot = buildPhraseTrie(culledStats);
+        const patternCandidates = collectPatternCandidatesFromTrie(
+            trieRoot,
+            PATTERN_MIN_COMMON_WORDS,
+            variations => this.filterRedundantVariations(variations),
+        );
+        const dedupedCandidates = deduplicatePatternCandidates(patternCandidates);
+        const filteredCandidates = filterContainedPatternCandidates(dedupedCandidates, {
+            overlapThreshold: 0.6,
+            maxShift: 3,
         });
 
-        // Process each length group to find patterns
-        // OPTIMIZATION: Limit pattern detection to reasonable phrase lengths (3-10 words)
-        for (const [length, lengthGroup] of Object.entries(phrasesByLength)) {
-            if (lengthGroup.length < 2) continue; // Need at least 2 phrases to form a pattern
-            if (parseInt(length, 10) > 10) continue; // Skip very long phrases for performance
+        const mergedPatterns = {};
+        const consumedPhrases = new Set();
 
-            for (let i = 0; i < lengthGroup.length; i++) {
-                const baseCandidate = lengthGroup[i];
-                if (consumedIndices.has(baseCandidate.index)) continue;
+        for (const candidate of filteredCandidates) {
+            if (!candidate.prefix || candidate.variations.length < 2) continue;
 
-                const wordsA = baseCandidate.phrase.split(' ');
-                let currentGroup = [baseCandidate];
-
-                // Find other phrases with the same length that share a common prefix
-                for (let j = i + 1; j < lengthGroup.length; j++) {
-                    const candidateB = lengthGroup[j];
-                    if (consumedIndices.has(candidateB.index)) continue;
-
-                    const wordsB = candidateB.phrase.split(' ');
-
-                    // Count common prefix words
-                    let commonPrefixLength = 0;
-                    for (let k = 0; k < wordsA.length; k++) {
-                        if (wordsA[k] === wordsB[k]) {
-                            commonPrefixLength++;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Only group if they share enough prefix and have different endings
-                    if (commonPrefixLength >= PATTERN_MIN_COMMON_WORDS &&
-                        commonPrefixLength < wordsA.length) { // Ensure there's a variation part
-                        currentGroup.push(candidateB);
-                    }
-                }
-
-                // If we found a group with variations, create a pattern
-                if (currentGroup.length > 1) {
-                    // Find the actual common prefix for all items in the group
-                    let commonPrefixLength = currentGroup[0].phrase.split(' ').length;
-                    for (let k = 1; k < currentGroup.length; k++) {
-                        const words = currentGroup[k].phrase.split(' ');
-                        const firstWords = currentGroup[0].phrase.split(' ');
-                        let currentPrefixLength = 0;
-                        while (currentPrefixLength < commonPrefixLength &&
-                               currentPrefixLength < words.length &&
-                               firstWords[currentPrefixLength] === words[currentPrefixLength]) {
-                            currentPrefixLength++;
-                        }
-                        commonPrefixLength = Math.min(commonPrefixLength, currentPrefixLength);
-                    }
-
-                    if (commonPrefixLength >= PATTERN_MIN_COMMON_WORDS) {
-                        const commonPrefix = currentGroup[0].phrase.split(' ').slice(0, commonPrefixLength).join(' ');
-                        const variations = new Set();
-                        let totalScore = 0;
-                        let totalOccurrences = 0;
-                        const totalMessageIds = new Set();
-
-                        currentGroup.forEach(item => {
-                            totalScore += item.score;
-                            totalOccurrences += item.occurrences || 0;
-                            if (item.messageIds && typeof item.messageIds.forEach === 'function') {
-                                item.messageIds.forEach(id => totalMessageIds.add(id));
-                            }
-                            consumedIndices.add(item.index);
-                            const variationPart = item.phrase.split(' ').slice(commonPrefixLength).join(' ').trim();
-                            if (variationPart) {
-                                variations.add(variationPart);
-                            }
-                        });
-
-                        const cleanedVariations = this.filterRedundantVariations(variations);
-
-                        if (cleanedVariations.size > 1) { // Only create pattern if there are actual variations
-                            const pattern = `${commonPrefix}|${Array.from(cleanedVariations).join('/')}`;
-                            const messageCap = this.totalAiMessagesProcessed > 0 ? this.totalAiMessagesProcessed : totalMessageIds.size;
-
-                            if (!mergedPatterns[pattern]) {
-                                mergedPatterns[pattern] = { score: 0, occurrences: 0, messageIds: new Set(), variationCount: 0 };
-                            }
-
-                            mergedPatterns[pattern].score += totalScore;
-                            mergedPatterns[pattern].occurrences += totalOccurrences;
-                            mergedPatterns[pattern].variationCount += Math.max(1, cleanedVariations.size);
-                            totalMessageIds.forEach(id => {
-                                if (mergedPatterns[pattern].messageIds.size >= messageCap) return;
-                                mergedPatterns[pattern].messageIds.add(id);
-                            });
-                        }
-                    }
-                }
+            const patternKey = `${candidate.prefix}|${candidate.variations.join('/')}`;
+            const messageCap = this.totalAiMessagesProcessed > 0
+                ? this.totalAiMessagesProcessed
+                : candidate.messageIds.size;
+            const cappedMessageIds = new Set();
+            for (const id of candidate.messageIds) {
+                if (cappedMessageIds.size >= messageCap) break;
+                cappedMessageIds.add(id);
             }
-        }
 
-        // Merge patterns that are subsets/extensions of each other
-        const finalMergedPatterns = this.mergeRelatedPatterns(mergedPatterns);
+            mergedPatterns[patternKey] = {
+                score: candidate.score,
+                occurrences: candidate.occurrences,
+                messageIds: cappedMessageIds,
+                variationCount: Math.max(1, candidate.variationCount),
+            };
+
+            candidate.phraseSet.forEach(phrase => consumedPhrases.add(phrase));
+        }
 
         // For remaining phrases, apply very strict filtering
         // We want to focus on patterns, not random standalone phrases
@@ -742,25 +910,24 @@ export class Analyzer {
 
         if (includeStandalone) {
             // If including standalone, use a much higher threshold to filter noise
-            const STANDALONE_THRESHOLD_MULTIPLIER = 3.0; // Standalone phrases need 3x the threshold
-            const standaloneThreshold = (this.settings.slopThreshold || 5) * STANDALONE_THRESHOLD_MULTIPLIER;
+            const STANDALONE_THRESHOLD_MULTIPLIER = 1.35; // Standalone phrases need a higher threshold
+            const standaloneThreshold = Math.min(10, (this.settings.slopThreshold || 5) * STANDALONE_THRESHOLD_MULTIPLIER);
 
-            for (let i = 0; i < candidates.length; i++) {
-                const candidate = candidates[i];
-                if (consumedIndices.has(candidate.index)) continue;
-
-                if (candidate.score >= standaloneThreshold) {
-                    remaining[candidate.phrase] = {
-                        score: candidate.score,
-                        messageCount: candidate.messageIds ? candidate.messageIds.size : 0,
-                        occurrences: candidate.occurrences,
+            for (const [phrase, stats] of Object.entries(culledStats)) {
+                if (consumedPhrases.has(phrase)) continue;
+                if ((stats.score || 0) >= standaloneThreshold) {
+                    const messageIds = stats.messageIds instanceof Set ? stats.messageIds : new Set();
+                    remaining[phrase] = {
+                        score: stats.score || 0,
+                        messageCount: messageIds.size,
+                        occurrences: stats.occurrences || 0,
                     };
                 }
             }
         }
 
         const normalizedMerged = {};
-        for (const [pattern, data] of Object.entries(finalMergedPatterns)) {
+        for (const [pattern, data] of Object.entries(mergedPatterns)) {
             const messageCount = data?.messageIds && typeof data.messageIds.size === 'number'
                 ? data.messageIds.size
                 : (data?.messageCount ?? 0);
@@ -770,7 +937,7 @@ export class Analyzer {
             const variationCount = Math.max(1, data?.variationCount ?? 1);
             const rawScore = Number(data?.score ?? 0);
             const normalizedScore = Number.isFinite(rawScore)
-                ? rawScore / Math.sqrt(variationCount)
+                ? Math.min(10, rawScore)
                 : 0;
             normalizedMerged[pattern] = {
                 score: Number.isFinite(normalizedScore) ? normalizedScore : 0,
@@ -786,8 +953,9 @@ export class Analyzer {
             if (!Number.isFinite(messageCount) || messageCount <= 1) {
                 continue;
             }
+            const rawScore = Number(data?.score ?? 0);
             normalizedRemaining[phrase] = {
-                score: data?.score ?? 0,
+                score: Math.min(10, Number.isFinite(rawScore) ? rawScore : 0),
                 messageCount,
                 occurrences: data?.occurrences ?? 0,
             };
@@ -1079,8 +1247,10 @@ export class Analyzer {
         
         // Add merged patterns that exceed threshold
         for (const [pattern, data] of Object.entries(latestData.merged || {})) {
-            const score = data?.score ?? 0;
+            const rawScore = Number(data?.score ?? 0);
+            const score = Number.isFinite(rawScore) ? rawScore : 0;
             if (score >= SLOP_THRESHOLD) {
+                const roundedScore = Number(score.toFixed(1));
                 // Check if this is a pattern with variations (uses | separator)
                 if (pattern.includes('|')) {
                     // Split by | to separate template from variations
@@ -1092,14 +1262,14 @@ export class Analyzer {
                         slopList.push({
                             pattern_template: `${template.trim()} {variant}`,
                             variants: variants,
-                            score: score,
+                            score: roundedScore,
                             type: 'pattern'
                         });
                     } else {
                         // Shouldn't happen but handle as regular phrase
                         slopList.push({
                             phrase: pattern,
-                            score: score,
+                            score: roundedScore,
                             type: 'pattern'
                         });
                     }
@@ -1107,20 +1277,21 @@ export class Analyzer {
                     // Pattern without variations
                     slopList.push({
                         phrase: pattern,
-                        score: score,
+                        score: roundedScore,
                         type: 'pattern'
                     });
                 }
             }
         }
-        
+
         // Add remaining individual phrases that exceed threshold
         for (const [phrase, data] of Object.entries(latestData.remaining || {})) {
-            const score = data?.score ?? 0;
+            const rawScore = Number(data?.score ?? 0);
+            const score = Number.isFinite(rawScore) ? rawScore : 0;
             if (score >= SLOP_THRESHOLD) {
                 slopList.push({
                     phrase: phrase,
-                    score: score,
+                    score: Number(score.toFixed(1)),
                     type: 'phrase'
                 });
             }
