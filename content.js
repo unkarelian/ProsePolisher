@@ -20,6 +20,56 @@ const EXTENSION_FOLDER_PATH = `scripts/extensions/third-party/${EXTENSION_NAME}`
 // --- State Variables ---
 let prosePolisherAnalyzer = null;
 let processedMessageIds = new Set();
+let analysisRefreshInProgress = false;
+let analysisRefreshPending = false;
+
+const AUTO_REFRESH_MESSAGE_TYPES = new Set(['normal', 'append', 'appendFinal', 'continue', 'first_message']);
+
+function extractSwipeState(message) {
+    const swipes = Array.isArray(message?.swipes) ? message.swipes : [];
+    const swipesLength = swipes.length;
+
+    const rawSwipeId = Number.parseInt(message?.swipe_id ?? 0, 10);
+    const safeSwipeId = Number.isNaN(rawSwipeId) || rawSwipeId < 0 ? 0 : rawSwipeId;
+
+    const normalizedSwipeId = swipesLength > 0
+        ? Math.min(Math.max(safeSwipeId, 0), swipesLength - 1)
+        : 0;
+
+    const isSwipePending = swipesLength > 0 ? safeSwipeId >= swipesLength : false;
+
+    return {
+        swipes,
+        swipesLength,
+        safeSwipeId,
+        normalizedSwipeId,
+        isSwipePending,
+    };
+}
+
+function getEffectiveMessageText(message, swipeState = null) {
+    if (!message) return '';
+
+    const state = swipeState ?? extractSwipeState(message);
+    const { swipes, swipesLength, normalizedSwipeId, isSwipePending } = state;
+
+    if (isSwipePending) {
+        return '';
+    }
+
+    if (typeof message.mes === 'string' && message.mes.trim()) {
+        return message.mes;
+    }
+
+    if (swipesLength > 0) {
+        const swipeText = swipes?.[normalizedSwipeId];
+        if (typeof swipeText === 'string' && swipeText.trim()) {
+            return swipeText;
+        }
+    }
+
+    return '';
+}
 
 // --- CONSTANTS ---
 const defaultSettings = {
@@ -254,8 +304,8 @@ function setupUI() {
                                 <span>Analysis Interval</span>
                             </label>
                             <div class="alignitemscenter flex-container flexFlowColumn flexBasis30p flexGrow flexShrink gap0">
-                                <input type="range" id="pp-analysis-interval" class="neo-range-slider" min="10" max="100" value="${settings.analysisInterval}" step="10">
-                                <input type="number" id="pp-analysis-interval-counter" class="neo-range-input" min="10" max="100" value="${settings.analysisInterval}" step="10">
+                                <input type="range" id="pp-analysis-interval" class="neo-range-slider" min="1" max="100" value="${settings.analysisInterval}" step="1">
+                                <input type="number" id="pp-analysis-interval-counter" class="neo-range-input" min="1" max="100" value="${settings.analysisInterval}" step="1">
                             </div>
                         </div>
                         <div class="range-block">
@@ -618,28 +668,28 @@ function setupUI() {
     
     // Analysis interval handlers
     $('#pp-analysis-interval').on('input', function() {
-        const value = parseInt($(this).val());
+        const rawValue = parseInt($(this).val(), 10);
+        const value = Number.isFinite(rawValue) ? Math.max(1, Math.min(rawValue, 100)) : 1;
         $('#pp-analysis-interval-counter').val(value);
+        $(this).val(value);
         debouncedSettingUpdate(() => {
             const settings = getSettings();
-            if (value >= 10 && value <= 100) {
-                settings.analysisInterval = value;
-                saveSettingsDebounced();
-                console.log(`${LOG_PREFIX} Updated analysisInterval to ${value}`);
-            }
+            settings.analysisInterval = value;
+            saveSettingsDebounced();
+            console.log(`${LOG_PREFIX} Updated analysisInterval to ${value}`);
         });
     });
     
     $('#pp-analysis-interval-counter').on('input', function() {
-        const value = parseInt($(this).val());
+        const rawValue = parseInt($(this).val(), 10);
+        const value = Number.isFinite(rawValue) ? Math.max(1, Math.min(rawValue, 100)) : 1;
         $('#pp-analysis-interval').val(value);
+        $(this).val(value);
         debouncedSettingUpdate(() => {
             const settings = getSettings();
-            if (value >= 10 && value <= 100) {
-                settings.analysisInterval = value;
-                saveSettingsDebounced();
-                console.log(`${LOG_PREFIX} Updated analysisInterval to ${value}`);
-            }
+            settings.analysisInterval = value;
+            saveSettingsDebounced();
+            console.log(`${LOG_PREFIX} Updated analysisInterval to ${value}`);
         });
     });
     
@@ -724,10 +774,15 @@ function setupAutoAnalysisListeners() {
     
     // Create handlers if they don't exist
     if (!messageReceivedHandler) {
-        messageReceivedHandler = (messageId) => handleIncomingMessage(messageId);
+        messageReceivedHandler = (messageId, messageType) => handleIncomingMessage(messageId, {
+            source: event_types.MESSAGE_RECEIVED,
+            messageType,
+        });
     }
     if (!messageSwipedHandler) {
-        messageSwipedHandler = (messageId) => handleIncomingMessage(messageId);
+        messageSwipedHandler = (messageId) => handleIncomingMessage(messageId, {
+            source: event_types.MESSAGE_SWIPED,
+        });
     }
     if (!generationStartedHandler) {
         generationStartedHandler = async (type, options, dryRun) => {
@@ -771,26 +826,63 @@ const debouncedMacroUpdate = () => {
     }, 5000); // OPTIMIZATION: Increased debounce to 5 seconds to reduce freezing
 };
 
-async function handleIncomingMessage(messageId) {
+async function handleIncomingMessage(messageId, options = {}) {
     if (!prosePolisherAnalyzer) return;
-    
+
+    const { source = event_types.MESSAGE_RECEIVED, messageType = null } = options;
+
     const context = getContext();
-    if (!context || !context.chat || !messageId) return;
-    
+    if (!context || !context.chat || messageId === undefined || messageId === null) return;
+
     const messageIndex = parseInt(messageId);
-    if (isNaN(messageIndex) || messageIndex < 0 || messageIndex >= context.chat.length) return;
-    
+    if (Number.isNaN(messageIndex) || messageIndex < 0 || messageIndex >= context.chat.length) return;
+
     const message = context.chat[messageIndex];
-    if (!message || !message.mes || message.is_user) return;
-    
+    if (!message || message.is_user) return;
+
+    const swipeState = extractSwipeState(message);
+    const { safeSwipeId, normalizedSwipeId, isSwipePending } = swipeState;
+
+    if (source === event_types.MESSAGE_SWIPED) {
+        console.debug(`${LOG_PREFIX} Ignoring analysis refresh for swipe selection ${messageIndex}:${safeSwipeId}`);
+        return;
+    }
+
+    if (isSwipePending) {
+        console.debug(`${LOG_PREFIX} Skipping auto-analysis for incomplete message ${messageIndex}:${safeSwipeId} (${messageType ?? 'unknown'})`);
+        return;
+    }
+
+    if (messageType === 'swipe') {
+        console.debug(`${LOG_PREFIX} Skipping auto-analysis for generated swipe ${messageIndex}:${safeSwipeId}`);
+        return;
+    }
+
+    const shouldRefreshAfterGeneration = source === event_types.MESSAGE_RECEIVED
+        && messageType
+        && (AUTO_REFRESH_MESSAGE_TYPES.has(messageType) || messageType === 'swipe');
+
+    if (shouldRefreshAfterGeneration) {
+        const effectiveTextForRefresh = getEffectiveMessageText(message, swipeState);
+        if (typeof effectiveTextForRefresh !== 'string' || !effectiveTextForRefresh.trim()) return;
+
+        const refreshLabel = messageType === 'swipe' ? 'generated swipe' : `generation (${messageType})`;
+        console.debug(`${LOG_PREFIX} Refreshing analysis after ${refreshLabel} ${messageIndex}:${safeSwipeId}`);
+        await refreshAnalysisAndCache();
+        return;
+    }
+
+    const effectiveText = getEffectiveMessageText(message, swipeState);
+    if (typeof effectiveText !== 'string' || !effectiveText.trim()) return;
+
     // Skip if already processed
-    const uniqueId = `${messageIndex}_${message.swipe_id || 0}`;
+    const uniqueId = `${messageIndex}_${normalizedSwipeId}`;
     if (processedMessageIds.has(uniqueId)) return;
-    
+
     processedMessageIds.add(uniqueId);
-    
+
     // Analyze the message
-    prosePolisherAnalyzer.analyzeAndTrackFrequency(message.mes);
+    prosePolisherAnalyzer.analyzeAndTrackFrequency(effectiveText);
     prosePolisherAnalyzer.incrementProcessedMessages();
     
     // Apply decay to old phrase scores periodically
@@ -808,6 +900,62 @@ async function handleIncomingMessage(messageId) {
     
     // Debounced macro update
     debouncedMacroUpdate();
+}
+
+function rebuildProcessedMessageIdsFromChat() {
+    if (!processedMessageIds) {
+        processedMessageIds = new Set();
+    } else {
+        processedMessageIds.clear();
+    }
+
+    const context = getContext();
+    if (!context || !Array.isArray(context.chat)) return;
+
+    context.chat.forEach((message, index) => {
+        if (!message || message.is_user) return;
+
+        const swipeState = extractSwipeState(message);
+        if (swipeState.isSwipePending) return;
+
+        const effectiveText = getEffectiveMessageText(message, swipeState);
+        if (typeof effectiveText !== 'string' || !effectiveText.trim()) return;
+
+        const { normalizedSwipeId, swipesLength } = swipeState;
+        const uniqueId = swipesLength > 0 ? `${index}_${normalizedSwipeId}` : `${index}_0`;
+        processedMessageIds.add(uniqueId);
+    });
+}
+
+async function refreshAnalysisAndCache() {
+    if (!prosePolisherAnalyzer) return;
+
+    analysisRefreshPending = true;
+    if (analysisRefreshInProgress) {
+        return;
+    }
+
+    analysisRefreshInProgress = true;
+    try {
+        while (analysisRefreshPending) {
+            analysisRefreshPending = false;
+
+            // Wait while another analysis (manual or silent) is running
+            while (prosePolisherAnalyzer && prosePolisherAnalyzer.isAnalyzingHistory) {
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+
+            if (!prosePolisherAnalyzer) {
+                break;
+            }
+
+            await performSilentChatAnalysis();
+        }
+    } catch (error) {
+        console.error(`${LOG_PREFIX} Error refreshing analysis cache:`, error);
+    } finally {
+        analysisRefreshInProgress = false;
+    }
 }
 
 // Silent version of chat history analysis for pre-generation
@@ -835,6 +983,7 @@ async function performSilentChatAnalysis() {
         if (prosePolisherAnalyzer.updateSlopListMacro) {
             prosePolisherAnalyzer.updateSlopListMacro();
         }
+        processedMessageIds.clear();
         return;
     }
 
@@ -871,10 +1020,21 @@ async function performSilentChatAnalysis() {
         
         // Process AI messages in chat history
         for (const message of chatMessages) {
-            if (message.is_user || !message.mes || typeof message.mes !== 'string') {
+            if (!message || message.is_user) {
                 continue;
             }
-            prosePolisherAnalyzer.analyzeAndTrackFrequency(message.mes);
+
+            const swipeState = extractSwipeState(message);
+            if (swipeState.isSwipePending) {
+                continue;
+            }
+
+            const effectiveText = getEffectiveMessageText(message, swipeState);
+            if (typeof effectiveText !== 'string' || !effectiveText.trim()) {
+                continue;
+            }
+
+            prosePolisherAnalyzer.analyzeAndTrackFrequency(effectiveText);
             aiMessagesAnalyzed++;
             prosePolisherAnalyzer.totalAiMessagesProcessed++;
         }
@@ -891,6 +1051,7 @@ async function performSilentChatAnalysis() {
         }
         
         console.log(`${LOG_PREFIX} Silent analysis complete. Analyzed ${aiMessagesAnalyzed} AI messages.`);
+        rebuildProcessedMessageIdsFromChat();
     } catch (error) {
         console.error(`${LOG_PREFIX} Error during silent chat analysis:`, error);
     }
