@@ -1917,8 +1917,14 @@ export class Analyzer {
         
         // Sort by score descending
         slopList.sort((a, b) => b.score - a.score);
+
+        const maxEntriesSetting = Number(this.settings?.maxSlopListEntries ?? -1);
+        if (Number.isFinite(maxEntriesSetting) && maxEntriesSetting > 0 && slopList.length > maxEntriesSetting) {
+            slopList.length = maxEntriesSetting;
+        }
         
-        console.log(`${LOG_PREFIX} getSlopList() returning ${slopList.length} items above threshold ${SLOP_THRESHOLD}`);
+        const capInfo = Number.isFinite(maxEntriesSetting) && maxEntriesSetting > 0 ? ` (capped at ${maxEntriesSetting})` : '';
+        console.log(`${LOG_PREFIX} getSlopList() returning ${slopList.length} items above threshold ${SLOP_THRESHOLD}${capInfo}`);
         return slopList;
     }
 

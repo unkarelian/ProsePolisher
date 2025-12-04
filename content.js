@@ -93,6 +93,7 @@ const defaultSettings = {
     autoAnalyze: false, // Disabled by default for performance
     analysisInterval: 50, // Messages between automatic analyses
     messageLimit: -1, // Number of recent messages to analyze (-1 for all)
+    maxSlopListEntries: -1, // Maximum entries exposed via {{slopList}} (-1 disables the cap)
 };
 
 // --- Extension State ---
@@ -131,6 +132,21 @@ function getSettings() {
     if (settings.autoAnalyze === undefined) settings.autoAnalyze = defaultSettings.autoAnalyze;
     if (settings.analysisInterval === undefined) settings.analysisInterval = defaultSettings.analysisInterval;
     if (settings.messageLimit === undefined) settings.messageLimit = defaultSettings.messageLimit;
+    if (settings.maxSlopListEntries === undefined) settings.maxSlopListEntries = defaultSettings.maxSlopListEntries;
+
+    // Sanitize the maximum entries setting to accepted range (-1 or 1-100)
+    const rawMaxEntries = Number(settings.maxSlopListEntries);
+    if (Number.isNaN(rawMaxEntries)) {
+        settings.maxSlopListEntries = defaultSettings.maxSlopListEntries;
+    } else if (rawMaxEntries === -1) {
+        settings.maxSlopListEntries = -1;
+    } else if (rawMaxEntries < 1) {
+        settings.maxSlopListEntries = 1;
+    } else if (rawMaxEntries > 100) {
+        settings.maxSlopListEntries = 100;
+    } else {
+        settings.maxSlopListEntries = Math.floor(rawMaxEntries);
+    }
 
     return settings;
 }
@@ -160,6 +176,7 @@ function loadAndApplySettings() {
         includeStandalonePhrases: settings.includeStandalonePhrases,
         useSignificance: settings.useSignificance,
         significanceWeight: settings.significanceWeight,
+        maxSlopListEntries: settings.maxSlopListEntries,
     });
 }
 
@@ -318,6 +335,16 @@ function setupUI() {
                             </div>
                             <small style="display: block; margin-top: 5px; opacity: 0.8;">Set to -1 to analyze entire chat history, or specify a number to only analyze the last N messages</small>
                         </div>
+                        <div class="range-block">
+                            <label for="pp-max-entries" title="Limit how many high-scoring entries {{slopList}} exposes (-1 disables the cap)">
+                                <span>Maximum Slop Entries</span>
+                            </label>
+                            <div class="alignitemscenter flex-container flexFlowColumn flexBasis30p flexGrow flexShrink gap0">
+                                <input type="range" id="pp-max-entries" class="neo-range-slider" min="-1" max="100" value="${settings.maxSlopListEntries}" step="1">
+                                <input type="number" id="pp-max-entries-counter" class="neo-range-input" min="-1" max="100" value="${settings.maxSlopListEntries}" step="1">
+                            </div>
+                            <small style="display: block; margin-top: 5px; opacity: 0.8;">Set to -1 to disable the limit; otherwise only the highest-scoring entries are kept</small>
+                        </div>
                     </div>
                     
                     <h3>Analysis Tools</h3>
@@ -365,6 +392,15 @@ function setupUI() {
     const debouncedSettingUpdate = (callback) => {
         clearTimeout(settingUpdateTimeout);
         settingUpdateTimeout = setTimeout(callback, 300);
+    };
+
+    const sanitizeMaxEntriesValue = (rawValue) => {
+        const value = Number(rawValue);
+        if (!Number.isFinite(value)) return -1;
+        if (value === -1) return -1;
+        if (value < 1) return 1;
+        if (value > 100) return 100;
+        return Math.floor(value);
     };
 
     $('#pp-ngram-max').on('input', function() {
@@ -692,7 +728,44 @@ function setupUI() {
             console.log(`${LOG_PREFIX} Updated analysisInterval to ${value}`);
         });
     });
-    
+
+    // Slop list entry cap handlers
+    $('#pp-max-entries').on('input', function() {
+        const rawValue = parseInt($(this).val(), 10);
+        const value = sanitizeMaxEntriesValue(rawValue);
+        if (value !== rawValue) {
+            $(this).val(value);
+        }
+        $('#pp-max-entries-counter').val(value);
+        debouncedSettingUpdate(() => {
+            const settings = getSettings();
+            settings.maxSlopListEntries = value;
+            saveSettingsDebounced();
+            if (prosePolisherAnalyzer?.refreshSlopListCache) {
+                prosePolisherAnalyzer.refreshSlopListCache();
+            }
+            console.log(`${LOG_PREFIX} Updated maxSlopListEntries to ${value}`);
+        });
+    });
+
+    $('#pp-max-entries-counter').on('input', function() {
+        const rawValue = parseInt($(this).val(), 10);
+        const value = sanitizeMaxEntriesValue(rawValue);
+        if (value !== rawValue) {
+            $(this).val(value);
+        }
+        $('#pp-max-entries').val(value);
+        debouncedSettingUpdate(() => {
+            const settings = getSettings();
+            settings.maxSlopListEntries = value;
+            saveSettingsDebounced();
+            if (prosePolisherAnalyzer?.refreshSlopListCache) {
+                prosePolisherAnalyzer.refreshSlopListCache();
+            }
+            console.log(`${LOG_PREFIX} Updated maxSlopListEntries to ${value}`);
+        });
+    });
+
     // Message limit handlers
     $('#pp-message-limit').on('input', function() {
         const value = parseInt($(this).val());
